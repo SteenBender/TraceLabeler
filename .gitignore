@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.venv/
+.claude/
+*.egg-info/
+dist/
+build/
+
+# Data & results (user-specific)
+results/
+labels/
+Uncoating/
+*.pkl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
