@@ -17,3 +17,4 @@ dependencies:
   - pip:
     - tifffile==2025.5.10
     - umap-learn
+    - torch>=2.0

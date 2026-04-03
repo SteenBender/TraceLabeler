@@ -39,13 +39,13 @@ def load_experiment(exp_name):
             "index": i,
             "time": t,
             "frames": f,
-            "clathrin": A[0],
-            "hsc70": A[1],
-            "auxilin": A[2],
             "lifetime_s": float(tr["lifetime_s"].flat[0]),
             "x": tr["x"][0],
             "y": tr["y"][0],
         }
+        # Map each channel name to its row in A by position in config.CHANNELS.
+        for ch_idx, ch in enumerate(config.CHANNELS):
+            track_dict[ch] = A[ch_idx]
 
         for ch_idx, ch in enumerate(config.CHANNELS):
             sr = steps_raw[ch][0, i]
@@ -82,6 +82,7 @@ def _load_and_pelt():
             delayed(fit_track_pelt)(tr) for tr in tracks
         )
         pelt_results[exp] = results
-        n_steps = [r["clathrin"]["n_steps"] for r in results]
-        print(f"done (median clathrin steps: {np.median(n_steps):.0f})")
+        primary_ch = config.CHANNELS[0]
+        n_steps = [r[primary_ch]["n_steps"] for r in results]
+        print(f"done (median {primary_ch} steps: {np.median(n_steps):.0f})")
     return all_data, pelt_results

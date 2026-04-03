@@ -36,6 +36,8 @@ class ActiveLabeler:
         experiments=None,
         save_path=None,
         calibration=None,
+        feature_mode="pelt",
+        cnn_device="cpu",
     ):
         self.all_data = all_data
         self.new_results = new_results
@@ -44,11 +46,13 @@ class ActiveLabeler:
         self.calibration = calibration or {}
         self.experiments = experiments or sorted(all_data.keys())
         self.save_path = save_path or config.SAVE_PATH
+        self.feature_mode = feature_mode  # "pelt" or "pretrained"
+        self.cnn_device = cnn_device
         self.pkl_path = (
             None  # set by __main__ after loading; used to sync pickle on refit
         )
 
-        print("Extracting features from all tracks …")
+        print("Extracting PELT features from all tracks …")
         self.feat_df, self.index_df = build_feature_matrix(
             all_data, new_results, self.experiments, channels
         )
@@ -60,17 +64,23 @@ class ActiveLabeler:
             (row.exp, int(row.idx)): gi for gi, row in self.index_df.iterrows()
         }
 
+        # Build raw trace sequences for pretrained features: list of (C, T_i) arrays
+        self._sequences = []
+        for exp in self.experiments:
+            for idx in range(len(all_data[exp])):
+                tr = all_data[exp][idx]
+                seq = np.stack([tr[ch].astype(np.float64) for ch in channels], axis=0)
+                self._sequences.append(seq)
+
         self.labels = {}
         self.label_set = set()
         self.model = None
-        from sklearn.preprocessing import RobustScaler
-
-        self.scaler = RobustScaler()
+        self._encoder = None  # TraceEncoder instance (persists across rounds)
+        self._embed_features = None  # cached (N, embed_dim) numpy array
         self.proba = None
         self.classes = None
         self.round_num = 0
         self.history = []
-        self.df_triggered = None
 
     # ── helpers ──
     def _key(self, exp, idx):
@@ -121,20 +131,28 @@ class ActiveLabeler:
                 arr[gi] = label
         return arr
 
-    def seed_from_analytical(
-        self,
-        df_triggered,
-        excess_col="is_excess_mol",
-        label_excess="hsc70_excess",
-        label_other="balanced",
-    ):
-        n_seeded = 0
-        for _, row in df_triggered.iterrows():
-            exp, idx = row.exp, int(row.idx)
-            label = label_excess if row[excess_col] else label_other
-            self.set_label(exp, idx, label)
-            n_seeded += 1
-        return n_seeded
+    # ── CNN pretraining & embedding extraction ──
+    def pretrain_cnn(self):
+        """Run MAE pretraining on all traces and cache embeddings."""
+        from .model import TraceEncoder
+
+        if self._encoder is not None and self._encoder.is_pretrained:
+            if self._embed_features is None:
+                # Encoder trained but embeddings not yet extracted (e.g. race
+                # condition between background pretrain thread and train()).
+                print("[Encoder] Extracting embeddings (encoder was already pretrained) …")
+                self._embed_features = self._encoder.extract_embeddings(self._sequences)
+                print(f"  Embedding shape: {self._embed_features.shape}")
+            return "Encoder already pretrained."
+        self._encoder = TraceEncoder(
+            n_channels=len(self.channels), device=self.cnn_device
+        )
+        print("[Encoder] Pretraining masked autoencoder on all traces …")
+        self._encoder.pretrain(self._sequences)
+        print("[Encoder] Extracting embeddings …")
+        self._embed_features = self._encoder.extract_embeddings(self._sequences)
+        print(f"  Embedding shape: {self._embed_features.shape}")
+        return "Encoder pretrained, embeddings cached."
 
     # ── train ──
     def train(self):
@@ -143,36 +161,41 @@ class ActiveLabeler:
 
         labeled_mask = self.get_labeled_mask()
         label_arr = self.get_label_array()
-        X_all = self.feat_df.values
-        X_labeled = X_all[labeled_mask]
         y_labeled = label_arr[labeled_mask]
         if len(set(y_labeled)) < 2:
             return None, "Need ≥ 2 distinct labels."
-        # HistGradientBoostingClassifier handles NaN natively — no
-        # scaler/imputation needed, but we keep the scaler for any
-        # downstream code that might reference it.
-        self.scaler.fit(X_labeled)
-        X_scaled = X_labeled  # raw features (NaN-safe)
-        X_all_scaled = X_all
+
+        # Select feature matrix based on mode
+        if self.feature_mode == "pretrained":
+            if self._embed_features is None:
+                self.pretrain_cnn()
+            X_all = self._embed_features
+        else:
+            X_all = self.feat_df.values
+
+        X_labeled = X_all[labeled_mask]
+
         self.model = HistGradientBoostingClassifier(
             max_iter=200, max_depth=4, learning_rate=0.1, random_state=42
         )
-        self.model.fit(X_scaled, y_labeled)
+        self.model.fit(X_labeled, y_labeled)
         self.classes = self.model.classes_
-        if len(X_scaled) >= 10:
-            n_splits = min(5, len(X_scaled) // max(len(set(y_labeled)), 1))
+
+        cv_mean = float("nan")
+        if len(X_labeled) >= 10:
+            n_splits = min(5, len(X_labeled) // max(len(set(y_labeled)), 1))
             n_splits = max(2, n_splits)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 cv_scores = cross_val_score(
-                    self.model, X_scaled, y_labeled, cv=n_splits, scoring="accuracy"
+                    self.model, X_labeled, y_labeled, cv=n_splits, scoring="accuracy"
                 )
             cv_mean = cv_scores.mean()
-        else:
-            cv_mean = float("nan")
-        self.proba = self.model.predict_proba(X_all_scaled)
+
+        self.proba = self.model.predict_proba(X_all)
         self.round_num += 1
-        train_acc = self.model.score(X_scaled, y_labeled)
+        train_acc = self.model.score(X_labeled, y_labeled)
+        mode_tag = "pretrained" if self.feature_mode == "pretrained" else "PELT"
         self.history.append(
             {
                 "round": self.round_num,
@@ -180,11 +203,12 @@ class ActiveLabeler:
                 "train_acc": train_acc,
                 "cv_acc": cv_mean,
                 "label_counts": self.label_counts(),
+                "feature_mode": self.feature_mode,
             }
         )
         msg = (
-            f"Round {self.round_num}: {self.n_labeled} labeled "
-            f"({self.label_counts()})\n"
+            f"Round {self.round_num} [{mode_tag}] features={X_all.shape[1]}d: "
+            f"{self.n_labeled} labeled ({self.label_counts()})\n"
             f"  Train acc: {train_acc:.3f}  |  CV acc: {cv_mean:.3f}"
         )
         return self.model, msg
@@ -272,15 +296,16 @@ class ActiveLabeler:
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 3))
         ax2 = ax.twinx()
+        primary_ch = self.channels[0]
         for ch in self.channels:
             color = self.channel_colors[ch]
             scale = self.calibration.get(ch, 1.0)
-            target_ax = ax if ch == "clathrin" else ax2
+            target_ax = ax if ch == primary_ch else ax2
             target_ax.plot(t, tr[ch] / scale, color=color, alpha=0.45, lw=0.5)
             target_ax.plot(t, nr[ch]["fit"] / scale, color=color, lw=1.3)
-        ax.set_ylabel("clathrin", fontsize=7, color=self.channel_colors["clathrin"])
+        ax.set_ylabel(primary_ch, fontsize=7, color=self.channel_colors[primary_ch])
         ax.tick_params(
-            axis="y", labelsize=7, labelcolor=self.channel_colors["clathrin"]
+            axis="y", labelsize=7, labelcolor=self.channel_colors[primary_ch]
         )
         ax2.set_ylabel("molecules", fontsize=7)
         ax2.tick_params(axis="y", labelsize=7)

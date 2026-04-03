@@ -1,8 +1,11 @@
 """Main tkinter application window for the active-learning trace labeler."""
 
+import json
 import os
 import random
+import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import matplotlib
@@ -16,6 +19,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 import numpy as np
 
+from .. import config
 from ..labeler import ActiveLabeler, UNLABELED
 from .patch_viewer import PatchViewerWindow
 from .pelt_tuner import PeltTunerWindow
@@ -24,9 +28,24 @@ from .pelt_tuner import PeltTunerWindow
 class _LabelerAppMethods:
     """Main application window (mixed into tk.Tk subclass by LabelerApp factory)."""
 
-    def __init__(self, labeler: ActiveLabeler):
+    def __init__(
+        self, pkl_path=None, labels_path=None, feature_mode="pelt", cnn_device="cpu"
+    ):
         tk.Tk.__init__(self)
-        self.labeler = labeler
+        self.labeler = None
+        self._pkl_path = pkl_path or config.PICKLE_PATH
+        self._labels_path = labels_path or config.SAVE_PATH
+        self._feature_mode = feature_mode
+        self._cnn_device = cnn_device
+        # Detect available devices (lazy import — torch may not be installed)
+        try:
+            from ..model import get_available_devices
+
+            self._available_devices = get_available_devices()
+        except ImportError:
+            self._available_devices = ["cpu"]
+        if self._cnn_device not in self._available_devices:
+            self._cnn_device = self._available_devices[0]
         self.title("Active Trace Labeler")
         self.geometry("1300x900")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -34,12 +53,449 @@ class _LabelerAppMethods:
         self.current_candidates = []
         self.candidate_page = 0
         self.n_per_page = 6
-        self._view_mode = "random"  # "top" | "low_conf" | "random"
+        self._view_mode = "random"
 
+        # Channel configuration rows built in the startup panel
+        self._ch_name_vars = []
+        self._ch_color_vars = []
+        self._ch_calib_vars = []
+        self._ch_color_btns = []
+
+        self._dark_theme = True
+        self._show_startup_panel()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Startup panel (folder browser + channel config)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _show_startup_panel(self):
+        self._startup_frame = ttk.Frame(self, padding=20)
+        self._startup_frame.pack(fill=tk.BOTH, expand=True)
+        f = self._startup_frame
+
+        ttk.Label(f, text="Active Trace Labeler", font=("Helvetica", 16, "bold")).pack(
+            pady=(0, 16)
+        )
+
+        # ── Data folder row ──
+        folder_frame = ttk.LabelFrame(f, text="Data Folder", padding=8)
+        folder_frame.pack(fill=tk.X, pady=4)
+
+        self._folder_var = tk.StringVar(value=str(config.DATA_ROOT))
+        folder_entry = ttk.Entry(folder_frame, textvariable=self._folder_var, width=60)
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(folder_frame, text="Browse…", command=self._browse_folder).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(
+            folder_frame, text="Detect Channels", command=self._detect_channels
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        # ── Channel configuration table ──
+        ch_outer = ttk.LabelFrame(f, text="Channel Configuration", padding=8)
+        ch_outer.pack(fill=tk.X, pady=8)
+
+        # Header row
+        hdr = ttk.Frame(ch_outer)
+        hdr.pack(fill=tk.X)
+        ttk.Label(hdr, text="#", width=3).grid(row=0, column=0, padx=4)
+        ttk.Label(hdr, text="Channel Name", width=18).grid(row=0, column=1, padx=4)
+        ttk.Label(hdr, text="Color", width=12).grid(row=0, column=2, padx=4)
+        ttk.Label(hdr, text="Calibration (AU/mol)", width=20).grid(
+            row=0, column=3, padx=4
+        )
+
+        self._ch_rows_frame = ttk.Frame(ch_outer)
+        self._ch_rows_frame.pack(fill=tk.X)
+
+        # Status label under the channel table
+        self._ch_status_var = tk.StringVar(
+            value="Click 'Detect Channels' to auto-fill from the selected folder."
+        )
+        ttk.Label(f, textvariable=self._ch_status_var, foreground="gray").pack(
+            anchor=tk.W
+        )
+
+        # Pre-populate with current config channels
+        self._populate_channel_rows(
+            config.CHANNELS, config.CHANNEL_COLORS, config.CALIBRATION
+        )
+
+        # ── Load options ──
+        load_frame = ttk.LabelFrame(f, text="Load Options", padding=8)
+        load_frame.pack(fill=tk.X, pady=4)
+
+        pkl_row = ttk.Frame(load_frame)
+        pkl_row.pack(fill=tk.X, pady=2)
+        ttk.Label(pkl_row, text="Cache (.pkl):", width=18).pack(side=tk.LEFT)
+        self._pkl_var = tk.StringVar(value=self._pkl_path)
+        ttk.Entry(pkl_row, textvariable=self._pkl_var, width=50).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(pkl_row, text="…", width=3, command=self._browse_pkl).pack(
+            side=tk.LEFT
+        )
+
+        labels_row = ttk.Frame(load_frame)
+        labels_row.pack(fill=tk.X, pady=2)
+        ttk.Label(labels_row, text="Labels (.json):", width=18).pack(side=tk.LEFT)
+        self._labels_var = tk.StringVar(value=self._labels_path)
+        ttk.Entry(labels_row, textvariable=self._labels_var, width=50).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(labels_row, text="…", width=3, command=self._browse_labels).pack(
+            side=tk.LEFT
+        )
+
+        # ── Load button ──
+        ttk.Button(f, text="Load Data & Launch", command=self._start_loading).pack(
+            pady=16, ipadx=20, ipady=6
+        )
+
+        self._load_status_var = tk.StringVar()
+        ttk.Label(f, textvariable=self._load_status_var, foreground="cyan").pack()
+
+    def _browse_folder(self):
+        chosen = filedialog.askdirectory(
+            title="Select folder containing ExNN/ directories",
+            initialdir=self._folder_var.get() or ".",
+        )
+        if chosen:
+            self._folder_var.set(chosen)
+            self._update_save_paths(chosen)
+            self._detect_channels()
+
+    def _update_save_paths(self, folder):
+        """Set default pkl and labels paths to subfolders inside *folder*."""
+        root = Path(folder)
+        self._pkl_var.set(str(root / "results" / "trace_data.pkl"))
+        self._labels_var.set(str(root / "labels" / "labels.json"))
+
+    def _detect_channels(self):
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            self._ch_status_var.set("Folder not found — enter a valid path first.")
+            return
+        # Discover experiment sub-directories
+        exps = sorted(
+            d.name
+            for d in Path(folder).iterdir()
+            if d.is_dir() and d.name.startswith("Ex")
+        )
+        if not exps:
+            self._ch_status_var.set(
+                "No ExNN/ sub-directories found in selected folder."
+            )
+            return
+        config.EXPERIMENTS = exps
+        n = config.detect_n_channels(folder, exps)
+        if n is None:
+            self._ch_status_var.set(
+                "Could not read ProcessedTracks.mat — check folder."
+            )
+            return
+        # Build default names: reuse existing names where possible
+        existing = config.CHANNELS
+        names = [existing[i] if i < len(existing) else f"channel_{i}" for i in range(n)]
+        self._populate_channel_rows(names, config.CHANNEL_COLORS, config.CALIBRATION)
+        self._ch_status_var.set(
+            f"Detected {n} channel(s) across {len(exps)} experiment(s): {', '.join(exps)}"
+        )
+
+    def _populate_channel_rows(self, names, colors, calibration):
+        """Rebuild the channel configuration rows."""
+        for w in self._ch_rows_frame.winfo_children():
+            w.destroy()
+        self._ch_name_vars.clear()
+        self._ch_color_vars.clear()
+        self._ch_calib_vars.clear()
+        self._ch_color_btns.clear()
+
+        default_colors = config._DEFAULT_COLORS
+        for i, ch in enumerate(names):
+            color = colors.get(ch, default_colors[i % len(default_colors)])
+            calib = calibration.get(ch, 1.0)
+
+            row = ttk.Frame(self._ch_rows_frame)
+            row.pack(fill=tk.X, pady=1)
+
+            ttk.Label(row, text=str(i), width=3).grid(row=0, column=0, padx=4)
+
+            name_var = tk.StringVar(value=ch)
+            self._ch_name_vars.append(name_var)
+            ttk.Entry(row, textvariable=name_var, width=18).grid(
+                row=0, column=1, padx=4
+            )
+
+            color_var = tk.StringVar(value=color)
+            self._ch_color_vars.append(color_var)
+            hex_color = mcolors.to_hex(color)
+            swatch = tk.Label(
+                row,
+                bg=hex_color,
+                width=6,
+                height=1,
+                relief=tk.SOLID,
+                borderwidth=1,
+                cursor="hand2",
+            )
+            swatch.grid(row=0, column=2, padx=4)
+            swatch.bind("<Button-1>", lambda e, idx=i: self._pick_color(idx) or "break")
+            self._ch_color_btns.append(swatch)
+
+            calib_var = tk.StringVar(value=str(calib))
+            self._ch_calib_vars.append(calib_var)
+            ttk.Entry(row, textvariable=calib_var, width=12).grid(
+                row=0, column=3, padx=4
+            )
+
+    def _open_color_picker(self, current_hex: str) -> "str | None":
+        """Open the custom colour chooser dialog and return the chosen hex, or None."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Pick colour")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        chosen = [None]
+
+        # Preset palette – ordered by hue (red → yellow → green → cyan → blue → purple),
+        # then pastels, then neutrals.
+        palette = [
+            # Row 1: vivid primaries & secondaries
+            "#ff0000", "#ff4400", "#ff8800", "#ffbb00", "#ffff00",
+            "#88ff00", "#00ff00", "#00ffaa", "#00ffff", "#00aaff",
+            # Row 2: blues, purples, pinks
+            "#0044ff", "#0000ff", "#4400ff", "#8800ff", "#bb00ff",
+            "#ff00ff", "#ff0088", "#ff0044", "#ff6688", "#ffaacc",
+            # Row 3: pastels
+            "#ffcccc", "#ffddbf", "#ffffcc", "#ccffcc", "#ccffff",
+            "#cce0ff", "#ccccff", "#e8ccff", "#ffccee", "#ffffff",
+            # Row 4: darks & neutrals
+            "#800000", "#884400", "#808000", "#006600", "#006666",
+            "#000080", "#440088", "#660044", "#a0a0a0", "#404040",
+        ]
+
+        grid = ttk.Frame(dlg, padding=8)
+        grid.pack()
+        cols = 10
+        for i_c, c in enumerate(palette):
+            btn = tk.Label(
+                grid, bg=c, width=3, height=1,
+                relief=tk.RAISED, borderwidth=1, cursor="hand2",
+            )
+            btn.grid(row=i_c // cols, column=i_c % cols, padx=1, pady=1)
+            btn.bind("<Button-1>", lambda e, col=c: _select(col))
+
+        entry_frame = ttk.Frame(dlg, padding=(8, 4))
+        entry_frame.pack(fill=tk.X)
+        ttk.Label(entry_frame, text="Hex:").pack(side=tk.LEFT)
+        hex_var = tk.StringVar(value=current_hex)
+        ttk.Entry(entry_frame, textvariable=hex_var, width=10).pack(side=tk.LEFT, padx=4)
+
+        preview = tk.Label(
+            entry_frame, bg=current_hex, width=4, height=1,
+            relief=tk.SOLID, borderwidth=1,
+        )
+        preview.pack(side=tk.LEFT, padx=4)
+
+        def _update_preview(*_args):
+            try:
+                preview.configure(bg=mcolors.to_hex(hex_var.get()))
+            except ValueError:
+                pass
+
+        hex_var.trace_add("write", _update_preview)
+
+        def _select(col):
+            chosen[0] = col
+            dlg.destroy()
+
+        def _confirm():
+            try:
+                chosen[0] = mcolors.to_hex(hex_var.get())
+            except ValueError:
+                chosen[0] = hex_var.get()
+            dlg.destroy()
+
+        btn_frame = ttk.Frame(dlg, padding=8)
+        btn_frame.pack()
+        ttk.Button(btn_frame, text="OK", command=_confirm).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=4)
+
+        dlg.wait_window()
+        return chosen[0]
+
+    def _pick_color(self, idx):
+        """Colour picker for the startup-panel channel config rows."""
+        current = self._ch_color_vars[idx].get()
+        try:
+            hex_current = mcolors.to_hex(current)
+        except ValueError:
+            hex_current = "#ffffff"
+
+        hex_color = self._open_color_picker(hex_current)
+        if hex_color:
+            self._ch_color_vars[idx].set(hex_color)
+            self._ch_color_btns[idx].configure(bg=hex_color)
+
+    def _pick_legend_color(self, ch, swatch):
+        """Colour picker for the live channel legend; updates plots immediately."""
+        current = mcolors.to_hex(self.labeler.channel_colors[ch])
+        hex_color = self._open_color_picker(current)
+        if hex_color:
+            self.labeler.channel_colors[ch] = hex_color
+            swatch.configure(bg=hex_color)
+            if self.card_widgets:
+                self._render_page()
+
+    def _browse_pkl(self):
+        path = filedialog.asksaveasfilename(
+            title="Cache file (.pkl)",
+            defaultextension=".pkl",
+            filetypes=[("Pickle", "*.pkl"), ("All", "*.*")],
+            initialfile=os.path.basename(self._pkl_var.get()),
+            initialdir=os.path.dirname(self._pkl_var.get()) or ".",
+        )
+        if path:
+            self._pkl_var.set(path)
+
+    def _browse_labels(self):
+        path = filedialog.asksaveasfilename(
+            title="Labels file (.json)",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+            initialfile=os.path.basename(self._labels_var.get()),
+            initialdir=os.path.dirname(self._labels_var.get()) or ".",
+        )
+        if path:
+            self._labels_var.set(path)
+
+    def _collect_channel_config(self):
+        """Read the channel rows and call config.configure_channels()."""
+        names = [
+            v.get().strip() or f"channel_{i}" for i, v in enumerate(self._ch_name_vars)
+        ]
+        colors = {n: self._ch_color_vars[i].get() for i, n in enumerate(names)}
+        calibration = {}
+        for i, n in enumerate(names):
+            try:
+                calibration[n] = float(self._ch_calib_vars[i].get())
+            except ValueError:
+                calibration[n] = 1.0
+        config.configure_channels(names, colors, calibration)
+
+    def _start_loading(self):
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Error", "Please select a valid data folder.")
+            return
+        if not self._ch_name_vars:
+            messagebox.showerror(
+                "Error", "No channels configured. Click 'Detect Channels' first."
+            )
+            return
+
+        config.DATA_ROOT = Path(folder)
+        config.TIFF_ROOT = Path(folder)
+        self._pkl_path = self._pkl_var.get()
+        self._labels_path = self._labels_var.get()
+        self._collect_channel_config()
+
+        self._load_status_var.set("Loading… please wait.")
+        self.update_idletasks()
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self):
+        """Run in background thread — load/prepare data then hand off to UI thread."""
+        from ..data_loader import _load_and_pelt
+        from ..serialization import load_prepared_data, save_bundle
+        from ..gui.splash import LoadingSplash
+
+        try:
+            pkl = self._pkl_path
+            if os.path.exists(pkl):
+                self.after(0, lambda: self._load_status_var.set("Loading cached data…"))
+                all_data, pelt_results, stored_channels = load_prepared_data(pkl)
+                # Remap track dict keys and PELT result keys when channel names
+                # have been renamed in the startup panel.
+                if stored_channels != config.CHANNELS and len(stored_channels) == len(
+                    config.CHANNELS
+                ):
+                    rename_map = {
+                        old: new
+                        for old, new in zip(stored_channels, config.CHANNELS)
+                        if old != new
+                    }
+                    for exp in all_data:
+                        for tr in all_data[exp]:
+                            for old, new in rename_map.items():
+                                if old in tr:
+                                    tr[new] = tr.pop(old)
+                                for suffix in (
+                                    "_fit",
+                                    "_numSteps",
+                                    "_stepStart",
+                                    "_stepSize",
+                                ):
+                                    if f"{old}{suffix}" in tr:
+                                        tr[f"{new}{suffix}"] = tr.pop(f"{old}{suffix}")
+                        for nr in pelt_results[exp]:
+                            for old, new in rename_map.items():
+                                if old in nr:
+                                    nr[new] = nr.pop(old)
+            else:
+                self.after(
+                    0,
+                    lambda: self._load_status_var.set(
+                        "Running PELT fitting (may take a few minutes)…"
+                    ),
+                )
+                all_data, pelt_results = _load_and_pelt()
+                os.makedirs(os.path.dirname(os.path.abspath(pkl)) or ".", exist_ok=True)
+                save_bundle(all_data, pelt_results, pkl)
+
+            self.after(0, lambda: self._finish_loading(all_data, pelt_results))
+        except Exception as exc:
+            import traceback
+
+            self.after(0, lambda: self._load_status_var.set(f"Error: {exc}"))
+            traceback.print_exc()
+
+    def _finish_loading(self, all_data, pelt_results):
+        from ..labeler import ActiveLabeler
+
+        labels_path = self._labels_path
+        os.makedirs(os.path.dirname(os.path.abspath(labels_path)) or ".", exist_ok=True)
+
+        labeler = ActiveLabeler(
+            all_data,
+            pelt_results,
+            config.CHANNELS,
+            config.CHANNEL_COLORS,
+            experiments=config.EXPERIMENTS,
+            save_path=labels_path,
+            calibration=config.CALIBRATION,
+            feature_mode=self._feature_mode,
+            cnn_device=self._cnn_device,
+        )
+        labeler.pkl_path = self._pkl_path if os.path.exists(self._pkl_path) else None
+
+        if os.path.exists(labels_path):
+            try:
+                n = labeler.load(labels_path)
+                print(f"  Auto-loaded {n} labels from {labels_path}")
+            except (json.JSONDecodeError, KeyError) as exc:
+                print(f"  Warning: could not load labels: {exc}")
+
+        self.labeler = labeler
+        self._startup_frame.destroy()
         self._build_ui()
         self._update_status()
 
-    # ── UI construction ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Main labeler UI — only shown after data is loaded
+    # ══════════════════════════════════════════════════════════════════════
+
     def _build_ui(self):
         # Top status bar
         self.status_var = tk.StringVar(value="Active Labeler")
@@ -68,10 +524,47 @@ class _LabelerAppMethods:
 
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
-        # Train
-        ttk.Button(ctrl, text="Train Model", command=self._train).pack(
-            fill=tk.X, pady=2
+        # Feature mode selector + Device + Train
+        model_frame = ttk.Frame(ctrl)
+        model_frame.pack(fill=tk.X)
+        # Features
+        feat_frame = ttk.Frame(model_frame)
+        feat_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Label(feat_frame, text="Features:").pack(anchor=tk.W)
+        self._feature_var = tk.StringVar(
+            value="Pretrained" if self._feature_mode == "pretrained" else "PELT"
         )
+        feature_combo = ttk.Combobox(
+            feat_frame,
+            textvariable=self._feature_var,
+            values=["PELT", "Pretrained"],
+            state="readonly",
+            width=10,
+        )
+        feature_combo.pack(fill=tk.X)
+        feature_combo.bind("<<ComboboxSelected>>", self._on_feature_changed)
+        # Device
+        dev_frame = ttk.Frame(model_frame)
+        dev_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        ttk.Label(dev_frame, text="Device:").pack(anchor=tk.W)
+        self._device_var = tk.StringVar(value=self._cnn_device)
+        self._device_combo = ttk.Combobox(
+            dev_frame,
+            textvariable=self._device_var,
+            values=self._available_devices,
+            state="readonly",
+            width=8,
+        )
+        self._device_combo.pack(fill=tk.X)
+        self._device_combo.bind("<<ComboboxSelected>>", self._on_device_changed)
+
+        self._pretrain_btn = ttk.Button(
+            ctrl, text="Pretrain Encoder", command=self._pretrain_cnn
+        )
+        self._train_btn = ttk.Button(ctrl, text="Train Model", command=self._train)
+        if self._feature_mode == "pretrained":
+            self._pretrain_btn.pack(fill=tk.X, pady=2)
+        self._train_btn.pack(fill=tk.X, pady=2)
 
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
@@ -128,6 +621,14 @@ class _LabelerAppMethods:
 
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
+        # Theme toggle
+        self._theme_btn_var = tk.StringVar(value="Theme: Dark")
+        ttk.Button(
+            ctrl, textvariable=self._theme_btn_var, command=self._toggle_theme
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
         # Diagnostics
         ttk.Button(ctrl, text="Diagnostics", command=self._show_diagnostics).pack(
             fill=tk.X, pady=2
@@ -154,9 +655,15 @@ class _LabelerAppMethods:
             hex_color = mcolors.to_hex(self.labeler.channel_colors[ch])
             row = ttk.Frame(legend_frame)
             row.pack(fill=tk.X, pady=1)
-            tk.Canvas(
-                row, width=14, height=14, bg=hex_color, highlightthickness=0
-            ).pack(side=tk.LEFT, padx=(0, 4))
+            swatch = tk.Label(
+                row, bg=hex_color, width=2, height=1,
+                relief=tk.SOLID, borderwidth=1, cursor="hand2",
+            )
+            swatch.pack(side=tk.LEFT, padx=(0, 4))
+            swatch.bind(
+                "<Button-1>",
+                lambda e, c=ch, s=swatch: self._pick_legend_color(c, s),
+            )
             ttk.Label(row, text=ch).pack(side=tk.LEFT)
 
         # ── Log panel ──
@@ -210,7 +717,9 @@ class _LabelerAppMethods:
         if self.labeler.history:
             h = self.labeler.history[-1]
             hist = f" | Train={h['train_acc']:.2f}, CV={h['cv_acc']:.2f}"
+        feat_tag = "Pretrained" if self._feature_mode == "pretrained" else "PELT"
         self.status_var.set(
+            f"[{feat_tag}] "
             f"Round {self.labeler.round_num}  |  "
             f"Labeled: {self.labeler.n_labeled}/{self.labeler.N}  |  "
             f"[{counts_str}]{hist}"
@@ -230,6 +739,33 @@ class _LabelerAppMethods:
         self.new_label_var.set("")
         self._update_status()
         self._log(f"Added label: '{name}'")
+
+    def _on_feature_changed(self, event=None):
+        choice = self._feature_var.get()
+        new_mode = "pretrained" if choice == "Pretrained" else "pelt"
+        self._feature_mode = new_mode
+        self.labeler.feature_mode = new_mode
+        if new_mode == "pretrained":
+            self._pretrain_btn.pack(fill=tk.X, pady=2, before=self._train_btn)
+        else:
+            self._pretrain_btn.pack_forget()
+        self._log(f"Switched to {choice} features")
+        self._update_status()
+
+    def _on_device_changed(self, event=None):
+        self._cnn_device = self._device_var.get()
+        self.labeler.cnn_device = self._cnn_device
+        self._log(f"Device set to {self._cnn_device}")
+
+    def _pretrain_cnn(self):
+        self._log("Pretraining CNN (masked autoencoder) …")
+        self.update_idletasks()
+
+        def _run():
+            msg = self.labeler.pretrain_cnn()
+            self.after(0, lambda: self._log(msg))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _train(self):
         self._log("Training …")
@@ -332,6 +868,17 @@ class _LabelerAppMethods:
         self._render_page()
 
     # ── Gallery rendering ────────────────────────────────────────────────
+    def _toggle_theme(self):
+        self._dark_theme = not self._dark_theme
+        if self._dark_theme:
+            plt.style.use("dark_background")
+            self._theme_btn_var.set("Theme: Dark")
+        else:
+            plt.style.use("default")
+            self._theme_btn_var.set("Theme: Light")
+        if self.card_widgets:
+            self._render_page()
+
     def _clear_gallery(self):
         self.placeholder.pack_forget() if self.placeholder.winfo_manager() else None
         # Close matplotlib figures to prevent memory leaks
@@ -461,17 +1008,13 @@ class _LabelerAppMethods:
             text="✕ Unlabel",
             command=lambda e=exp, i=idx: self._unlabel_one(e, i, card),
         ).pack(side=tk.RIGHT, padx=2)
-        skip_btn = ttk.Button(
-            btn_row, text="Skip", command=lambda: self._skip_card(card)
-        )
-        skip_btn.pack(side=tk.RIGHT, padx=2)
-
-        cur = cand["current_label"]
-        cur_str = cur if cur != UNLABELED else "unlabeled"
-        ttk.Label(btn_row, text=f"  cur: {cur_str}", font=("Helvetica", 8)).pack(
-            side=tk.RIGHT
-        )
-
+        ttk.Button(
+            btn_row,
+            text="Save PDF",
+            command=lambda f=fig, t=title, e=exp, i=idx: self._save_trace_pdf(
+                f, t, e, i
+            ),
+        ).pack(side=tk.RIGHT, padx=2)
         self.card_widgets.append(card)
         return card
 
@@ -510,8 +1053,58 @@ class _LabelerAppMethods:
         self._update_status()
         self._log(f"Deleted class '{target}' ({len(affected)} traces unlabeled)")
 
-    def _skip_card(self, card):
-        self._flash_card(card, "gray")
+    def _save_trace_pdf(self, fig, title, exp, idx):
+        safe = (
+            title.replace(" ", "_")
+            .replace("#", "")
+            .replace("=", "")
+            .replace(".", "")
+            .replace("/", "_")
+            .replace("\\", "_")
+            .strip("_")
+        )
+        out_dir = Path(self._labels_path).parent / "pdfs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{safe}.pdf"
+        fig.savefig(path, bbox_inches="tight")
+        self._log(f"Saved PDF: {path}")
+        self._update_pdf_index(exp, idx, path.name)
+
+    def _update_pdf_index(self, exp, idx, pdf_filename):
+        import csv
+
+        index_path = Path(self._labels_path).parent / "pdfs" / "index.csv"
+        # Load existing entries
+        entries = {}
+        if index_path.exists():
+            with open(index_path, newline="") as fh:
+                for row in csv.DictReader(fh):
+                    row.setdefault("data_root", "")
+                    key = (row["experiment"], int(row["id"]))
+                    entries[key] = row
+        # Get xy from track data (mean position over the track lifetime)
+        tr = self.labeler.all_data[exp][idx]
+        x_mean = float(np.mean(tr["x"]))
+        y_mean = float(np.mean(tr["y"]))
+        entries[(exp, idx)] = {
+            "experiment": exp,
+            "id": idx,
+            "x": f"{x_mean:.3f}",
+            "y": f"{y_mean:.3f}",
+            "pdf": pdf_filename,
+            "data_root": str(Path(config.DATA_ROOT).resolve()),
+        }
+        # Sort: group by experiment name, then ascending ID
+        sorted_rows = sorted(
+            entries.values(), key=lambda r: (r["experiment"], int(r["id"]))
+        )
+        with open(index_path, "w", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=["experiment", "id", "x", "y", "pdf", "data_root"]
+            )
+            writer.writeheader()
+            writer.writerows(sorted_rows)
+        self._log(f"Updated PDF index: {index_path}")
 
     def _flash_card(self, card, color):
         """Briefly flash the card border to confirm action."""
@@ -645,16 +1238,21 @@ class _LabelerAppMethods:
         self._log(f"Loaded {n} labels from {path}")
 
     def _on_close(self):
-        if self.labeler.n_labeled > 0:
+        if self.labeler is not None and self.labeler.n_labeled > 0:
             if messagebox.askyesno("Quit", "Save labels before closing?"):
                 self._save()
         self.destroy()
 
 
-def LabelerApp(labeler):
+def LabelerApp(pkl_path=None, labels_path=None, feature_mode="pelt", cnn_device="cpu"):
     """Factory: creates a tk.Tk subclass with all LabelerApp methods."""
 
     class _App(_LabelerAppMethods, tk.Tk):
         pass
 
-    return _App(labeler)
+    return _App(
+        pkl_path=pkl_path,
+        labels_path=labels_path,
+        feature_mode=feature_mode,
+        cnn_device=cnn_device,
+    )

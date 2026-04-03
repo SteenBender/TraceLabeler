@@ -16,7 +16,6 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
-plt.style.use("dark_background")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
@@ -25,7 +24,6 @@ from joblib import Parallel, delayed
 from .. import config
 from ..pelt import fit_track_pelt
 from ..features import build_feature_matrix
-from ..analytical import run_analytical
 from ..serialization import save_bundle
 
 
@@ -265,12 +263,12 @@ class PeltTunerWindow:
             nr_new = fit_track_pelt(tr, pen_mult=pen_mult, min_plateau=min_plateau)
 
             row, col = divmod(i, ncols)
+            step_parts = "  ".join(
+                f"{ch[:3]}:{nr_new[ch]['n_steps']}" for ch in config.CHANNELS
+            )
             card = ttk.LabelFrame(
                 self._grid_frame,
-                text=f"{exp} #{idx}  "
-                f"[cla:{nr_new['clathrin']['n_steps']} steps, "
-                f"hsc:{nr_new['hsc70']['n_steps']}, "
-                f"aux:{nr_new['auxilin']['n_steps']}]",
+                text=f"{exp} #{idx}  [{step_parts}]",
                 padding=3,
             )
             card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
@@ -281,10 +279,11 @@ class PeltTunerWindow:
             ax = fig.add_subplot(111)
             ax2 = ax.twinx()
             t = tr["time"]
+            primary_ch = config.CHANNELS[0]
             for ch in config.CHANNELS:
                 color = self._labeler.channel_colors[ch]
                 scale = self._labeler.calibration.get(ch, 1.0)
-                target_ax = ax if ch == "clathrin" else ax2
+                target_ax = ax if ch == primary_ch else ax2
                 target_ax.plot(t, tr[ch] / scale, color=color, alpha=0.45, lw=0.5)
                 target_ax.plot(t, nr_new[ch]["fit"] / scale, color=color, lw=1.4)
             ax.tick_params(labelsize=6)
@@ -363,17 +362,20 @@ class PeltTunerWindow:
             new_results = {}
             for exp in experiments:
                 tracks = labeler.all_data[exp]
-                results = Parallel(n_jobs=config.N_JOBS, )(
+                results = Parallel(
+                    n_jobs=config.N_JOBS,
+                )(
                     delayed(fit_track_pelt)(
                         tr, pen_mult=pen_mult, min_plateau=min_plateau
                     )
                     for tr in tracks
                 )
                 new_results[exp] = results
-                n_steps = [r["clathrin"]["n_steps"] for r in results]
+                primary_ch = config.CHANNELS[0]
+                n_steps = [r[primary_ch]["n_steps"] for r in results]
                 self._log(
                     f"  {exp}: {len(tracks)} tracks — "
-                    f"median clathrin steps: {np.median(n_steps):.0f}"
+                    f"median {primary_ch} steps: {np.median(n_steps):.0f}"
                 )
                 pbar.update(1)
             pbar.close()
@@ -385,15 +387,13 @@ class PeltTunerWindow:
                 total=1 + (1 if pkl_path else 0),
                 desc="Post-processing",
             )
-            df_triggered = run_analytical(labeler.all_data, new_results, experiments)
-            self._log(f"  Analytical: {len(df_triggered)} triggered events.")
             pbar2.update(1)
 
             # ── Phase 3: Save pickle ──
             saved_mb = None
             if pkl_path:
                 saved_mb = save_bundle(
-                    labeler.all_data, new_results, df_triggered, pkl_path
+                    labeler.all_data, new_results, pkl_path
                 )
                 self._log(f"  Pickle saved → {pkl_path} ({saved_mb:.1f} MB)")
                 pbar2.update(1)
@@ -403,20 +403,17 @@ class PeltTunerWindow:
             self.win.after(
                 0,
                 lambda: self._on_applied(
-                    new_results, df_triggered, pen_mult, min_plateau, saved_mb, pkl_path
+                    new_results, pen_mult, min_plateau, saved_mb, pkl_path
                 ),
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_applied(
-        self, new_results, df_triggered, pen_mult, min_plateau, saved_mb, pkl_path
-    ):
+    def _on_applied(self, new_results, pen_mult, min_plateau, saved_mb, pkl_path):
         labeler = self._labeler
 
-        # Update PELT results, analytical detections, and feature matrix
+        # Update PELT results and feature matrix
         labeler.new_results = new_results
-        labeler.df_triggered = df_triggered
         feat_df, index_df = build_feature_matrix(
             labeler.all_data, new_results, labeler.experiments, labeler.channels
         )
@@ -434,15 +431,14 @@ class PeltTunerWindow:
         self._applying = False
         self._apply_btn.config(state=tk.NORMAL)
         n_tracks = sum(len(labeler.all_data[e]) for e in labeler.experiments)
-        n_triggered = len(df_triggered)
         pkl_msg = (
-            f"  Pickle updated → {pkl_path} ({saved_mb:.1f} MB)."
+            f"  Pickle updated \u2192 {pkl_path} ({saved_mb:.1f} MB)."
             if saved_mb is not None
-            else "  No pickle path — re-run --prepare to persist."
+            else "  No pickle path \u2014 re-run --prepare to persist."
         )
         self._status_var.set(
-            f"Applied pen×={pen_mult:.2f}, min_plateau={min_plateau} to "
-            f"{n_tracks} tracks. Analytical: {n_triggered} triggered events. "
+            f"Applied pen\u00d7={pen_mult:.2f}, min_plateau={min_plateau} to "
+            f"{n_tracks} tracks. "
             f"Model reset — retrain before reviewing predictions.{pkl_msg}"
         )
 
@@ -454,7 +450,7 @@ class PeltTunerWindow:
             self._app._update_status()
             log_msg = (
                 f"PELT refit: pen×={pen_mult:.2f}, min_plateau={min_plateau} "
-                f"→ {n_tracks} tracks, {n_triggered} analytical events. Retrain the model."
+                f"\u2192 {n_tracks} tracks. Retrain the model."
             )
             if saved_mb is not None:
                 log_msg += f" Pickle saved ({saved_mb:.1f} MB)."

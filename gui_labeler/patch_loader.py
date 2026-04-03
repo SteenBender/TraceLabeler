@@ -11,12 +11,20 @@ from . import config
 _patch_cache: dict = {}
 _patch_cache_lock = threading.Lock()
 
-# C-index (1-based) for each channel, matching the Cx-*.tif filename prefix
-_CHANNEL_C_IDX = {"clathrin": 1, "hsc70": 2, "auxilin": 3}
+
+def _channel_c_idx(ch):
+    """Return the 1-based C-index for *ch* based on its position in config.CHANNELS.
+
+    Index 0 → C1, index 1 → C2, etc.  Falls back to 1 if the channel is not found.
+    """
+    try:
+        return config.CHANNELS.index(ch) + 1
+    except ValueError:
+        return 1
 
 
 def _find_channel_tiff(exp, ch):
-    ci = _CHANNEL_C_IDX[ch]
+    ci = _channel_c_idx(ch)
     matches = sorted(glob.glob(str(config.TIFF_ROOT / exp / f"C{ci}-*.tif")))
     return matches[0] if matches else None
 
@@ -66,7 +74,9 @@ def _load_patches_for_page(candidates, labeler, half=5):
 
         for ch in config.CHANNELS:
             with _patch_cache_lock:
-                uncached = [c for c in exp_cands if (c["exp"], ch, c["idx"]) not in _patch_cache]
+                uncached = [
+                    c for c in exp_cands if (c["exp"], ch, c["idx"]) not in _patch_cache
+                ]
             if not uncached:
                 continue
             path = _find_channel_tiff(exp, ch)
@@ -96,7 +106,9 @@ def _load_patches_for_page(candidates, labeler, half=5):
                         pos = [frame_to_pos[f] for f in frame_arr.tolist()]
                         sub = frames_data[pos, y0:y1, x0:x1]
                         # Pad to full (2*half, 2*half) when near image border
-                        out = np.zeros((len(frame_arr), 2 * half, 2 * half), dtype=np.uint16)
+                        out = np.zeros(
+                            (len(frame_arr), 2 * half, 2 * half), dtype=np.uint16
+                        )
                         oy, ox = half - (cy - y0), half - (cx - x0)
                         out[:, oy : oy + (y1 - y0), ox : ox + (x1 - x0)] = sub
                         _patch_cache[(exp, ch, idx)] = out

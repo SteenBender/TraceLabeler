@@ -1,5 +1,7 @@
 """Feature extraction from tracks and PELT results."""
 
+from itertools import combinations
+
 import numpy as np
 import pandas as pd
 
@@ -46,14 +48,37 @@ def extract_features(tr, nr, channels):
         )
     feats["lifetime"] = float(tr["lifetime_s"])
     feats["n_frames"] = T
-    h_pos = feats.get("hsc70_n_pos_steps", 0)
-    a_pos = feats.get("auxilin_n_pos_steps", 0)
-    feats["hsc70_aux_step_ratio"] = (
-        (h_pos / a_pos) if a_pos > 0 else (float("inf") if h_pos > 0 else 0.0)
-    )
-    feats["hsc70_aux_mol_ratio"] = feats.get("hsc70_mol_pos", 0) / (
-        feats.get("auxilin_mol_pos", 0) + 1e-6
-    )
+    # Generic pairwise cross-channel features for every pair of channels.
+    for ch_i, ch_j in combinations(channels, 2):
+        n_i = feats.get(f"{ch_i}_n_pos_steps", 0)
+        n_j = feats.get(f"{ch_j}_n_pos_steps", 0)
+        # Step count and molecule ratios
+        feats[f"{ch_i}_{ch_j}_step_ratio"] = (
+            (n_i / n_j) if n_j > 0 else (float("inf") if n_i > 0 else 0.0)
+        )
+        feats[f"{ch_i}_{ch_j}_mol_ratio"] = feats.get(f"{ch_i}_mol_pos", 0) / (
+            feats.get(f"{ch_j}_mol_pos", 0) + 1e-6
+        )
+        # First positive step lag: positive = ch_i leads ch_j, negative = ch_j leads
+        fp_i = feats.get(f"{ch_i}_first_pos_frame", np.nan)
+        fp_j = feats.get(f"{ch_j}_first_pos_frame", np.nan)
+        feats[f"{ch_i}_{ch_j}_first_step_lag"] = (
+            float(fp_i - fp_j) if not (np.isnan(fp_i) or np.isnan(fp_j)) else np.nan
+        )
+        # Pearson correlation of raw signals
+        sig_i = tr[ch_i].astype(float)
+        sig_j = tr[ch_j].astype(float)
+        if sig_i.std() > 0 and sig_j.std() > 0:
+            feats[f"{ch_i}_{ch_j}_signal_corr"] = float(np.corrcoef(sig_i, sig_j)[0, 1])
+        else:
+            feats[f"{ch_i}_{ch_j}_signal_corr"] = np.nan
+        # Pearson correlation of PELT fits (captures co-varying step structure)
+        fit_i = nr[ch_i]["fit"].astype(float)
+        fit_j = nr[ch_j]["fit"].astype(float)
+        if fit_i.std() > 0 and fit_j.std() > 0:
+            feats[f"{ch_i}_{ch_j}_fit_corr"] = float(np.corrcoef(fit_i, fit_j)[0, 1])
+        else:
+            feats[f"{ch_i}_{ch_j}_fit_corr"] = np.nan
     return feats
 
 
