@@ -9,6 +9,7 @@ import pandas as pd
 
 from . import config
 from .features import build_feature_matrix
+from .filters import VALID, IGNORED, apply_all_filters
 
 UNLABELED = "__unlabeled__"
 
@@ -74,6 +75,10 @@ class ActiveLabeler:
 
         self.labels = {}
         self.label_set = set()
+        self.sub_labels = {}   # key -> "valid" or "ignored"
+        self.filter_config = {}  # last-applied filter configuration
+        self._pre_filter_labels = {}  # key -> label saved before filter overwrote it
+        self.include_ignored_in_training = False
         self.model = None
         self._encoder = None  # TraceEncoder instance (persists across rounds)
         self._embed_features = None  # cached (N, embed_dim) numpy array
@@ -103,6 +108,74 @@ class ActiveLabeler:
 
     def remove_label(self, exp, idx):
         self.labels.pop(self._key(exp, idx), None)
+
+    # ── sub-label / filter mgmt ──
+    def get_sub_label(self, exp, idx):
+        return self.sub_labels.get(self._key(exp, idx), VALID)
+
+    def set_sub_label(self, exp, idx, sub_label):
+        self.sub_labels[self._key(exp, idx)] = sub_label
+
+    def apply_filters(self, filter_config):
+        """Run filters on all traces, populating sub_labels and auto-labeling
+        ignored traces with the filter reason (e.g. "existence", "intensity+temporal").
+
+        Pre-filter labels are saved so they can be restored by clear_filters().
+        """
+        # Start fresh: restore any previous auto-labels before re-running
+        self._restore_pre_filter_labels()
+
+        self.filter_config = filter_config
+        self._pre_filter_labels = {}
+        n_ignored = 0
+
+        for exp in self.experiments:
+            for idx in range(len(self.all_data[exp])):
+                key = self._key(exp, idx)
+                tr = self.all_data[exp][idx]
+                nr = self.new_results[exp][idx]
+                sub_label, reason = apply_all_filters(tr, nr, filter_config)
+                self.sub_labels[key] = sub_label
+                if sub_label == IGNORED:
+                    # Save whatever label the trace had before we overwrite it
+                    self._pre_filter_labels[key] = self.labels.get(key, UNLABELED)
+                    self.labels[key] = reason
+                    self.label_set.add(reason)
+                    n_ignored += 1
+
+        return n_ignored
+
+    def _restore_pre_filter_labels(self):
+        """Restore labels that were overwritten by a previous apply_filters call."""
+        for key, original in self._pre_filter_labels.items():
+            if original == UNLABELED:
+                self.labels.pop(key, None)
+            else:
+                self.labels[key] = original
+        self._pre_filter_labels = {}
+        # Rebuild label_set so stale filter-name labels are removed
+        self.label_set = set(self.labels.values())
+
+    def clear_filters(self):
+        """Remove all sub-labels and restore pre-filter labels."""
+        self._restore_pre_filter_labels()
+        self.sub_labels.clear()
+        self.filter_config = {}
+
+    def get_ignored_mask(self):
+        """Boolean mask: True for globally-indexed traces marked ignored."""
+        mask = np.zeros(self.N, dtype=bool)
+        for key, sl in self.sub_labels.items():
+            if sl == IGNORED:
+                exp, idx = self._parse_key(key)
+                gi = self._global_idx(exp, idx)
+                if gi is not None:
+                    mask[gi] = True
+        return mask
+
+    @property
+    def n_ignored(self):
+        return sum(1 for v in self.sub_labels.values() if v == IGNORED)
 
     @property
     def n_labeled(self):
@@ -140,7 +213,9 @@ class ActiveLabeler:
             if self._embed_features is None:
                 # Encoder trained but embeddings not yet extracted (e.g. race
                 # condition between background pretrain thread and train()).
-                print("[Encoder] Extracting embeddings (encoder was already pretrained) …")
+                print(
+                    "[Encoder] Extracting embeddings (encoder was already pretrained) …"
+                )
                 self._embed_features = self._encoder.extract_embeddings(self._sequences)
                 print(f"  Embedding shape: {self._embed_features.shape}")
             return "Encoder already pretrained."
@@ -160,6 +235,10 @@ class ActiveLabeler:
         from sklearn.model_selection import cross_val_score
 
         labeled_mask = self.get_labeled_mask()
+        # Exclude ignored traces from training unless opted in
+        if not self.include_ignored_in_training:
+            ignored_mask = self.get_ignored_mask()
+            labeled_mask = labeled_mask & ~ignored_mask
         label_arr = self.get_label_array()
         y_labeled = label_arr[labeled_mask]
         if len(set(y_labeled)) < 2:
@@ -213,7 +292,17 @@ class ActiveLabeler:
         )
         return self.model, msg
 
-    def get_top_predictions(self, target_label, n=20, unlabeled_only=True):
+    def get_top_predictions(
+        self, target_label, n=None, unlabeled_only=True, labeled_only=False, show_ignored=False
+    ):
+        """Return traces sorted by descending probability for *target_label*.
+
+        Parameters
+        ----------
+        n : int or None
+            Maximum number of results to return.  ``None`` (default) returns all
+            eligible traces.
+        """
         if self.proba is None:
             return []
         try:
@@ -223,7 +312,14 @@ class ActiveLabeler:
         probs = self.proba[:, label_idx]
         labeled_mask = self.get_labeled_mask()
         label_arr = self.get_label_array()
-        eligible = ~labeled_mask if unlabeled_only else np.ones(self.N, dtype=bool)
+        if unlabeled_only:
+            eligible = ~labeled_mask
+        elif labeled_only:
+            eligible = labeled_mask
+        else:
+            eligible = np.ones(self.N, dtype=bool)
+        if not show_ignored:
+            eligible = eligible & ~self.get_ignored_mask()
         order = np.argsort(-probs)
         results = []
         for gi in order:
@@ -240,16 +336,24 @@ class ActiveLabeler:
                     "current_label": label_arr[gi],
                 }
             )
-            if len(results) >= n:
+            if n is not None and len(results) >= n:
                 break
         return results
 
-    def get_low_confidence_predictions(self, target_label, n=50, unlabeled_only=True):
+    def get_low_confidence_predictions(
+        self, target_label, n=None, unlabeled_only=True, labeled_only=False, show_ignored=False
+    ):
         """Return traces predicted as *target_label* with the lowest confidence.
 
         These are traces where the model's top predicted class equals
         *target_label*, sorted by ascending probability — i.e. the most
         uncertain predictions for that class.
+
+        Parameters
+        ----------
+        n : int or None
+            Maximum number of results to return.  ``None`` (default) returns all
+            eligible traces.
         """
         if self.proba is None:
             return []
@@ -261,7 +365,14 @@ class ActiveLabeler:
         predicted_classes = self.classes[np.argmax(self.proba, axis=1)]
         labeled_mask = self.get_labeled_mask()
         label_arr = self.get_label_array()
-        eligible = ~labeled_mask if unlabeled_only else np.ones(self.N, dtype=bool)
+        if unlabeled_only:
+            eligible = ~labeled_mask
+        elif labeled_only:
+            eligible = labeled_mask
+        else:
+            eligible = np.ones(self.N, dtype=bool)
+        if not show_ignored:
+            eligible = eligible & ~self.get_ignored_mask()
         # Only keep traces whose *predicted* class is the target
         predicted_as_target = predicted_classes == target_label
         mask = eligible & predicted_as_target
@@ -282,7 +393,7 @@ class ActiveLabeler:
                     "current_label": label_arr[gi],
                 }
             )
-            if len(results) >= n:
+            if n is not None and len(results) >= n:
                 break
         return results
 
@@ -325,6 +436,9 @@ class ActiveLabeler:
             "label_set": sorted(self.label_set),
             "round_num": self.round_num,
             "history": self.history,
+            "sub_labels": self.sub_labels,
+            "filter_config": self.filter_config,
+            "pre_filter_labels": self._pre_filter_labels,
         }
         dir_ = os.path.dirname(os.path.abspath(path))
         os.makedirs(dir_, exist_ok=True)
@@ -351,5 +465,8 @@ class ActiveLabeler:
         self.label_set = set(data.get("label_set", []))
         self.round_num = data.get("round_num", 0)
         self.history = data.get("history", [])
+        self.sub_labels = data.get("sub_labels", {})
+        self.filter_config = data.get("filter_config", {})
+        self._pre_filter_labels = data.get("pre_filter_labels", {})
         self.label_set.update(set(self.labels.values()))
         return len(self.labels)

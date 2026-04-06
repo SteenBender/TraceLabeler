@@ -428,6 +428,16 @@ class PeltTunerWindow:
         labeler.proba = None
         labeler.classes = None
 
+        # Re-apply filters if a filter config is active (PELT results changed)
+        if labeler.filter_config:
+            n_ignored = labeler.apply_filters(labeler.filter_config)
+            try:
+                self._app._filter_status_var.set(
+                    f"{n_ignored}/{labeler.N} traces ignored (re-applied after PELT refit)"
+                )
+            except Exception:
+                pass
+
         self._applying = False
         self._apply_btn.config(state=tk.NORMAL)
         n_tracks = sum(len(labeler.all_data[e]) for e in labeler.experiments)

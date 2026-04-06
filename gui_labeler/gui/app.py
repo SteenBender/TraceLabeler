@@ -20,9 +20,23 @@ from matplotlib.figure import Figure
 import numpy as np
 
 from .. import config
+from ..filters import IGNORED, FILTER_EXISTENCE, FILTER_INTENSITY, FILTER_TEMPORAL
 from ..labeler import ActiveLabeler, UNLABELED
+from .filter_dialog import FilterDialog
 from .patch_viewer import PatchViewerWindow
 from .pelt_tuner import PeltTunerWindow
+
+# Prefix shown in the review combo for system/filter labels (not user-created)
+_FILTER_PREFIX = "\u2298 "  # ⊘
+_FILTER_NAMES = {FILTER_EXISTENCE, FILTER_INTENSITY, FILTER_TEMPORAL}
+
+# Candidates to prefetch / extend per batch (5 pages × 6 cards)
+_PREFETCH = 30
+
+
+def _is_filter_label(lbl):
+    """True if *lbl* consists entirely of filter-name parts (e.g. 'existence+temporal')."""
+    return bool(lbl) and all(p in _FILTER_NAMES for p in lbl.split("+"))
 
 
 class _LabelerAppMethods:
@@ -50,7 +64,9 @@ class _LabelerAppMethods:
         self.geometry("1300x900")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.current_candidates = []
+        self.current_candidates = []  # visible slice (grows on demand)
+        self._candidate_pool = []  # full sorted list computed upfront
+        self._pool_offset = 0  # next index to extend from pool
         self.candidate_page = 0
         self.n_per_page = 6
         self._view_mode = "random"
@@ -262,17 +278,49 @@ class _LabelerAppMethods:
         # then pastels, then neutrals.
         palette = [
             # Row 1: vivid primaries & secondaries
-            "#ff0000", "#ff4400", "#ff8800", "#ffbb00", "#ffff00",
-            "#88ff00", "#00ff00", "#00ffaa", "#00ffff", "#00aaff",
+            "#ff0000",
+            "#ff4400",
+            "#ff8800",
+            "#ffbb00",
+            "#ffff00",
+            "#88ff00",
+            "#00ff00",
+            "#00ffaa",
+            "#00ffff",
+            "#00aaff",
             # Row 2: blues, purples, pinks
-            "#0044ff", "#0000ff", "#4400ff", "#8800ff", "#bb00ff",
-            "#ff00ff", "#ff0088", "#ff0044", "#ff6688", "#ffaacc",
+            "#0044ff",
+            "#0000ff",
+            "#4400ff",
+            "#8800ff",
+            "#bb00ff",
+            "#ff00ff",
+            "#ff0088",
+            "#ff0044",
+            "#ff6688",
+            "#ffaacc",
             # Row 3: pastels
-            "#ffcccc", "#ffddbf", "#ffffcc", "#ccffcc", "#ccffff",
-            "#cce0ff", "#ccccff", "#e8ccff", "#ffccee", "#ffffff",
+            "#ffcccc",
+            "#ffddbf",
+            "#ffffcc",
+            "#ccffcc",
+            "#ccffff",
+            "#cce0ff",
+            "#ccccff",
+            "#e8ccff",
+            "#ffccee",
+            "#ffffff",
             # Row 4: darks & neutrals
-            "#800000", "#884400", "#808000", "#006600", "#006666",
-            "#000080", "#440088", "#660044", "#a0a0a0", "#404040",
+            "#800000",
+            "#884400",
+            "#808000",
+            "#006600",
+            "#006666",
+            "#000080",
+            "#440088",
+            "#660044",
+            "#a0a0a0",
+            "#404040",
         ]
 
         grid = ttk.Frame(dlg, padding=8)
@@ -280,8 +328,13 @@ class _LabelerAppMethods:
         cols = 10
         for i_c, c in enumerate(palette):
             btn = tk.Label(
-                grid, bg=c, width=3, height=1,
-                relief=tk.RAISED, borderwidth=1, cursor="hand2",
+                grid,
+                bg=c,
+                width=3,
+                height=1,
+                relief=tk.RAISED,
+                borderwidth=1,
+                cursor="hand2",
             )
             btn.grid(row=i_c // cols, column=i_c % cols, padx=1, pady=1)
             btn.bind("<Button-1>", lambda e, col=c: _select(col))
@@ -290,11 +343,17 @@ class _LabelerAppMethods:
         entry_frame.pack(fill=tk.X)
         ttk.Label(entry_frame, text="Hex:").pack(side=tk.LEFT)
         hex_var = tk.StringVar(value=current_hex)
-        ttk.Entry(entry_frame, textvariable=hex_var, width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(entry_frame, textvariable=hex_var, width=10).pack(
+            side=tk.LEFT, padx=4
+        )
 
         preview = tk.Label(
-            entry_frame, bg=current_hex, width=4, height=1,
-            relief=tk.SOLID, borderwidth=1,
+            entry_frame,
+            bg=current_hex,
+            width=4,
+            height=1,
+            relief=tk.SOLID,
+            borderwidth=1,
         )
         preview.pack(side=tk.LEFT, padx=4)
 
@@ -320,7 +379,9 @@ class _LabelerAppMethods:
         btn_frame = ttk.Frame(dlg, padding=8)
         btn_frame.pack()
         ttk.Button(btn_frame, text="OK", command=_confirm).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
+            side=tk.LEFT, padx=4
+        )
 
         dlg.wait_window()
         return chosen[0]
@@ -490,6 +551,13 @@ class _LabelerAppMethods:
         self.labeler = labeler
         self._startup_frame.destroy()
         self._build_ui()
+        # Restore filter status if sub_labels were loaded
+        if labeler.n_ignored > 0:
+            self._filter_status_var.set(
+                f"{labeler.n_ignored}/{labeler.N} traces ignored"
+            )
+            # Auto-enable "Show ignored traces" so filter labels appear in the combo
+            self._show_ignored_var.set(True)
         self._update_status()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -508,7 +576,7 @@ class _LabelerAppMethods:
         )
         status_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
 
-        # ── Control panel (left sidebar) ──
+        # ── Left panel (labeling workflow) ──
         ctrl = ttk.LabelFrame(self, text="Controls", padding=6)
         ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
 
@@ -575,10 +643,6 @@ class _LabelerAppMethods:
             ctrl, textvariable=self.review_label_var, state="readonly", width=20
         )
         self.review_combo.pack(fill=tk.X)
-        self.unlabeled_only_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            ctrl, text="Unlabeled only", variable=self.unlabeled_only_var
-        ).pack(anchor=tk.W)
         pred_row = ttk.Frame(ctrl)
         pred_row.pack(fill=tk.X, pady=2)
         ttk.Button(pred_row, text="Show Top", command=self._show_predictions).pack(
@@ -586,6 +650,9 @@ class _LabelerAppMethods:
         )
         ttk.Button(pred_row, text="Show Low", command=self._show_low_confidence).pack(
             side=tk.LEFT, expand=True, fill=tk.X
+        )
+        ttk.Button(ctrl, text="Show Labeled", command=self._show_labeled).pack(
+            fill=tk.X, pady=2
         )
         ttk.Button(ctrl, text="Show Random Traces", command=self._show_random).pack(
             fill=tk.X, pady=2
@@ -614,28 +681,6 @@ class _LabelerAppMethods:
 
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
-        # PELT Tuner
-        ttk.Button(ctrl, text="PELT Tuner", command=self._show_pelt_tuner).pack(
-            fill=tk.X, pady=2
-        )
-
-        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        # Theme toggle
-        self._theme_btn_var = tk.StringVar(value="Theme: Dark")
-        ttk.Button(
-            ctrl, textvariable=self._theme_btn_var, command=self._toggle_theme
-        ).pack(fill=tk.X, pady=2)
-
-        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        # Diagnostics
-        ttk.Button(ctrl, text="Diagnostics", command=self._show_diagnostics).pack(
-            fill=tk.X, pady=2
-        )
-
-        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
         # Save / Load
         save_load_row = ttk.Frame(ctrl)
         save_load_row.pack(fill=tk.X, pady=2)
@@ -646,41 +691,9 @@ class _LabelerAppMethods:
             side=tk.LEFT, expand=True, fill=tk.X
         )
 
-        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        # ── Channel legend ──
-        legend_frame = ttk.LabelFrame(ctrl, text="Channel Legend", padding=4)
-        legend_frame.pack(fill=tk.X, pady=2)
-        for ch in self.labeler.channels:
-            hex_color = mcolors.to_hex(self.labeler.channel_colors[ch])
-            row = ttk.Frame(legend_frame)
-            row.pack(fill=tk.X, pady=1)
-            swatch = tk.Label(
-                row, bg=hex_color, width=2, height=1,
-                relief=tk.SOLID, borderwidth=1, cursor="hand2",
-            )
-            swatch.pack(side=tk.LEFT, padx=(0, 4))
-            swatch.bind(
-                "<Button-1>",
-                lambda e, c=ch, s=swatch: self._pick_legend_color(c, s),
-            )
-            ttk.Label(row, text=ch).pack(side=tk.LEFT)
-
-        # ── Log panel ──
-        ttk.Label(ctrl, text="Log:").pack(anchor=tk.W, pady=(8, 0))
-        self.log_text = tk.Text(
-            ctrl,
-            width=28,
-            height=12,
-            font=("Courier", 9),
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        # ── Main area (trace gallery) ──
+        # ── Gallery frame (created now, packed AFTER right panel so right panel
+        #    gets its space before the expand=True gallery claims the rest) ──
         self.gallery_frame = ttk.Frame(self)
-        self.gallery_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # Placeholder label
         self.placeholder = ttk.Label(
@@ -702,6 +715,106 @@ class _LabelerAppMethods:
         self.card_widgets = []
         self._card_figures = []  # track matplotlib figures for cleanup
 
+        # ── Right panel (tools & settings) — packed BEFORE gallery so it
+        #    claims its natural width before gallery's expand=True runs ──
+        right = ttk.LabelFrame(self, text="Tools", padding=6)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=4, pady=4)
+
+        # ── Filters ──
+        filter_frame = ttk.LabelFrame(right, text="Filters", padding=4)
+        filter_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(
+            filter_frame, text="Configure Filters...", command=self._open_filter_dialog
+        ).pack(fill=tk.X, pady=2)
+        self._show_ignored_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame,
+            text="Show ignored traces",
+            variable=self._show_ignored_var,
+            command=self._update_status,
+        ).pack(anchor=tk.W)
+        self._train_ignored_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame,
+            text="Include ignored in training",
+            variable=self._train_ignored_var,
+            command=self._on_train_ignored_toggled,
+        ).pack(anchor=tk.W)
+        self._filter_status_var = tk.StringVar(value="No filters active")
+        ttk.Label(
+            filter_frame,
+            textvariable=self._filter_status_var,
+            foreground="gray",
+            font=("Helvetica", 8),
+        ).pack(anchor=tk.W)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # PELT Tuner
+        ttk.Button(right, text="PELT Tuner", command=self._show_pelt_tuner).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # Diagnostics
+        ttk.Button(right, text="Diagnostics", command=self._show_diagnostics).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(
+            right, text="Save Predictions (CSV)", command=self._save_predictions
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # Theme toggle
+        self._theme_btn_var = tk.StringVar(value="Theme: Dark")
+        ttk.Button(
+            right, textvariable=self._theme_btn_var, command=self._toggle_theme
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ── Channel legend ──
+        legend_frame = ttk.LabelFrame(right, text="Channel Legend", padding=4)
+        legend_frame.pack(fill=tk.X, pady=2)
+        for ch in self.labeler.channels:
+            hex_color = mcolors.to_hex(self.labeler.channel_colors[ch])
+            row = ttk.Frame(legend_frame)
+            row.pack(fill=tk.X, pady=1)
+            swatch = tk.Label(
+                row,
+                bg=hex_color,
+                width=2,
+                height=1,
+                relief=tk.SOLID,
+                borderwidth=1,
+                cursor="hand2",
+            )
+            swatch.pack(side=tk.LEFT, padx=(0, 4))
+            swatch.bind(
+                "<Button-1>",
+                lambda e, c=ch, s=swatch: self._pick_legend_color(c, s),
+            )
+            ttk.Label(row, text=ch).pack(side=tk.LEFT)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ── Log panel ──
+        ttk.Label(right, text="Log:").pack(anchor=tk.W, pady=(4, 0))
+        self.log_text = tk.Text(
+            right,
+            width=28,
+            height=12,
+            font=("Courier", 9),
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # ── Gallery packed last so it fills remaining space ──
+        self.gallery_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
     # ── Logging ──────────────────────────────────────────────────────────
     def _log(self, msg):
         self.log_text.configure(state=tk.NORMAL)
@@ -718,17 +831,32 @@ class _LabelerAppMethods:
             h = self.labeler.history[-1]
             hist = f" | Train={h['train_acc']:.2f}, CV={h['cv_acc']:.2f}"
         feat_tag = "Pretrained" if self._feature_mode == "pretrained" else "PELT"
+        ignored_str = ""
+        if self.labeler.n_ignored > 0:
+            ignored_str = f"  |  Ignored: {self.labeler.n_ignored}"
         self.status_var.set(
             f"[{feat_tag}] "
             f"Round {self.labeler.round_num}  |  "
-            f"Labeled: {self.labeler.n_labeled}/{self.labeler.N}  |  "
+            f"Labeled: {self.labeler.n_labeled}/{self.labeler.N}{ignored_str}  |  "
             f"[{counts_str}]{hist}"
         )
-        # update review combo
-        opts = sorted(self.labeler.label_set) if self.labeler.label_set else []
+        # Update review combo — filter labels are shown only when show_ignored is on,
+        # and are prefixed with ⊘ to visually distinguish them from user labels.
+        all_labels = sorted(self.labeler.label_set) if self.labeler.label_set else []
+        if self._show_ignored_var.get():
+            opts = [
+                (_FILTER_PREFIX + l if _is_filter_label(l) else l) for l in all_labels
+            ]
+        else:
+            opts = [l for l in all_labels if not _is_filter_label(l)]
         self.review_combo["values"] = opts
         if opts and self.review_label_var.get() not in opts:
             self.review_label_var.set(opts[0])
+
+    def _get_review_label(self):
+        """Return the raw stored label from the review combo (strips ⊘ prefix)."""
+        val = self.review_label_var.get()
+        return val[len(_FILTER_PREFIX) :] if val.startswith(_FILTER_PREFIX) else val
 
     # ── Actions ──────────────────────────────────────────────────────────
     def _add_label(self):
@@ -778,46 +906,122 @@ class _LabelerAppMethods:
         self._update_status()
 
     def _show_predictions(self):
-        target = self.review_label_var.get()
-        if not target or self.labeler.proba is None:
+        target = self._get_review_label()
+        if not target:
+            return
+        if self.labeler.proba is None:
             messagebox.showinfo("Review", "Train the model first.")
             return
-        unlabeled_only = self.unlabeled_only_var.get()
-        self.current_candidates = self.labeler.get_top_predictions(
-            target, n=50, unlabeled_only=unlabeled_only
+        show_ignored = self._show_ignored_var.get()
+        pool = self.labeler.get_top_predictions(
+            target, n=None, unlabeled_only=True, show_ignored=show_ignored
         )
-        if not self.current_candidates:
+        if not pool:
             self._log(f"No candidates for '{target}'")
             return
+        self._candidate_pool = pool
+        self._pool_offset = min(_PREFETCH, len(pool))
+        self.current_candidates = pool[: self._pool_offset]
         self._view_mode = "top"
         self.candidate_page = 0
         self._render_page()
 
     def _show_low_confidence(self):
-        target = self.review_label_var.get()
-        if not target or self.labeler.proba is None:
+        target = self._get_review_label()
+        if not target:
+            return
+        if self.labeler.proba is None:
             messagebox.showinfo("Review", "Train the model first.")
             return
-        unlabeled_only = self.unlabeled_only_var.get()
-        self.current_candidates = self.labeler.get_low_confidence_predictions(
-            target, n=50, unlabeled_only=unlabeled_only
+        show_ignored = self._show_ignored_var.get()
+        pool = self.labeler.get_low_confidence_predictions(
+            target, n=None, unlabeled_only=True, show_ignored=show_ignored
         )
-        if not self.current_candidates:
+        if not pool:
             self._log(f"No low-confidence candidates for '{target}'")
             return
+        self._candidate_pool = pool
+        self._pool_offset = min(_PREFETCH, len(pool))
+        self.current_candidates = pool[: self._pool_offset]
         self._view_mode = "low_conf"
         self.candidate_page = 0
         self._render_page()
 
     def _show_random(self):
-        unlabeled_only = self.unlabeled_only_var.get()
+        show_ignored = self._show_ignored_var.get()
         pairs = [(row.exp, int(row.idx)) for _, row in self.labeler.index_df.iterrows()]
-        if unlabeled_only:
-            pairs = [p for p in pairs if self.labeler.get_label(*p) == UNLABELED]
+        if not show_ignored:
+            pairs = [p for p in pairs if self.labeler.get_sub_label(*p) != IGNORED]
         if not pairs:
             self._log("No eligible traces to show.")
             return
-        sample = random.sample(pairs, min(50, len(pairs)))
+        random.shuffle(pairs)
+        pool = [
+            {
+                "exp": e,
+                "idx": i,
+                "prob": None,
+                "current_label": self.labeler.get_label(e, i),
+            }
+            for e, i in pairs
+        ]
+        self._candidate_pool = pool
+        self._pool_offset = min(_PREFETCH, len(pool))
+        self.current_candidates = pool[: self._pool_offset]
+        self._view_mode = "random"
+        self.candidate_page = 0
+        self._render_page()
+
+    def _show_labeled(self):
+        """Show all traces labeled with the currently selected review label,
+        sorted by model probability (descending) when a model is trained."""
+        target = self._get_review_label()
+        if not target:
+            return
+        pairs = [
+            (row.exp, int(row.idx))
+            for _, row in self.labeler.index_df.iterrows()
+            if self.labeler.get_label(row.exp, int(row.idx)) == target
+        ]
+        if not pairs:
+            self._log(f"No traces labeled as '{target}'")
+            return
+        # Sort by probability descending when model is available
+        if self.labeler.proba is not None and target in list(self.labeler.classes):
+            label_idx = list(self.labeler.classes).index(target)
+            pool = []
+            for exp, idx in pairs:
+                gi = self.labeler._global_idx(exp, idx)
+                prob = (
+                    float(self.labeler.proba[gi, label_idx]) if gi is not None else 0.0
+                )
+                pool.append(
+                    {"exp": exp, "idx": idx, "prob": prob, "current_label": target}
+                )
+            pool.sort(key=lambda x: -x["prob"])
+        else:
+            pool = [
+                {"exp": e, "idx": i, "prob": None, "current_label": target}
+                for e, i in pairs
+            ]
+        self._candidate_pool = pool
+        self._pool_offset = min(_PREFETCH, len(pool))
+        self.current_candidates = pool[: self._pool_offset]
+        self._view_mode = "labeled"
+        self.candidate_page = 0
+        self._render_page()
+        self._log(f"Showing {len(pool)} labeled traces for '{target}'")
+
+    def _show_ignored_traces(self):
+        """Show all traces marked as ignored by the active filters."""
+        pairs = [
+            (row.exp, int(row.idx))
+            for _, row in self.labeler.index_df.iterrows()
+            if self.labeler.get_sub_label(row.exp, int(row.idx)) == IGNORED
+        ]
+        if not pairs:
+            self._log("No ignored traces to show.")
+            return
         self.current_candidates = [
             {
                 "exp": e,
@@ -825,11 +1029,12 @@ class _LabelerAppMethods:
                 "prob": None,
                 "current_label": self.labeler.get_label(e, i),
             }
-            for e, i in sample
+            for e, i in pairs
         ]
         self._view_mode = "random"
         self.candidate_page = 0
         self._render_page()
+        self._log(f"Showing {len(pairs)} ignored traces")
 
     def _show_patches(self):
         if not self.current_candidates:
@@ -844,6 +1049,28 @@ class _LabelerAppMethods:
     def _show_pelt_tuner(self):
         PeltTunerWindow(self)
 
+    # ── Filters ──────────────────────────────────────────────────────────
+    def _open_filter_dialog(self):
+        dlg = FilterDialog(self, self.labeler.channels, self.labeler.filter_config)
+        self.wait_window(dlg)
+        result = dlg.get_result()
+        if result is None:
+            return  # cancelled
+        if result == "clear":
+            self.labeler.clear_filters()
+            self._filter_status_var.set("No filters active")
+            self._log("Filters cleared")
+            self._update_status()
+            return
+        n_ignored = self.labeler.apply_filters(result)
+        n_total = self.labeler.N
+        self._filter_status_var.set(f"{n_ignored}/{n_total} traces ignored")
+        self._log(f"Filters applied: {n_ignored}/{n_total} traces marked ignored")
+        self._update_status()
+
+    def _on_train_ignored_toggled(self):
+        self.labeler.include_ignored_in_training = self._train_ignored_var.get()
+
     def _prev_page(self):
         if self.candidate_page > 0:
             self.candidate_page -= 1
@@ -854,9 +1081,18 @@ class _LabelerAppMethods:
         if self.candidate_page < max_page:
             self.candidate_page += 1
             self._render_page()
+        elif self._pool_offset < len(self._candidate_pool):
+            # Reached end of visible slice — extend from pool
+            next_batch = self._candidate_pool[
+                self._pool_offset : self._pool_offset + _PREFETCH
+            ]
+            self.current_candidates.extend(next_batch)
+            self._pool_offset += len(next_batch)
+            self.candidate_page += 1
+            self._render_page()
 
     def _confirm_all(self):
-        target = self.review_label_var.get()
+        target = self._get_review_label()
         if not target:
             return
         start = self.candidate_page * self.n_per_page
@@ -892,16 +1128,24 @@ class _LabelerAppMethods:
     def _render_page(self):
         self._clear_gallery()
 
-        is_random = self._view_mode == "random"
-        target = None if is_random else self.review_label_var.get()
+        is_random = self._view_mode in ("random", "labeled")
+        target = None if self._view_mode == "random" else self._get_review_label()
         start = self.candidate_page * self.n_per_page
         page = self.current_candidates[start : start + self.n_per_page]
-        n_total = len(self.current_candidates)
-        max_page = max(0, (n_total - 1) // self.n_per_page)
-        page_str = f"Page {self.candidate_page + 1}/{max_page + 1}  ({n_total} total)"
+        n_shown = len(self.current_candidates)
+        n_pool = len(self._candidate_pool)
+        max_page = max(0, (n_shown - 1) // self.n_per_page)
+        # Show total pool size so user knows how many traces exist
+        total_str = f"{n_pool}" if n_pool > n_shown else f"{n_shown}"
+        page_str = (
+            f"Page {self.candidate_page + 1}/{max_page + 1}"
+            f"  ({n_shown} loaded / {total_str} total)"
+        )
 
         if self._view_mode == "random":
             header_text = f"Random traces  —  {page_str}"
+        elif self._view_mode == "labeled":
+            header_text = f"Labeled '{target}'  —  {page_str}"
         elif self._view_mode == "low_conf":
             header_text = f"Low-confidence predictions for '{target}'  —  {page_str}"
         else:
@@ -936,6 +1180,8 @@ class _LabelerAppMethods:
         is_random = prob is None
 
         title = f"{exp} #{idx}" if is_random else f"{exp} #{idx}  P={prob:.3f}"
+        if self.labeler.get_sub_label(exp, idx) == IGNORED:
+            title += f"  {_FILTER_PREFIX.strip()}IGNORED"
         card = ttk.LabelFrame(parent, text=title, padding=4)
 
         # Matplotlib figure embedded in tk
@@ -949,72 +1195,106 @@ class _LabelerAppMethods:
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Button row
+        # Button row — grid layout so all items share equal width
         btn_row = ttk.Frame(card)
         btn_row.pack(fill=tk.X, pady=(2, 0))
 
         all_labels = sorted(self.labeler.label_set)
 
         if is_random:
-            # Random mode: dropdown over all labels + "Label" button
+            # 4 equal columns: [combo] [Label] [✕ Unlabel] [Save PDF]
             label_var = tk.StringVar(value=all_labels[0] if all_labels else "")
-            combo = ttk.Combobox(
+            ttk.Combobox(
                 btn_row,
                 textvariable=label_var,
                 values=all_labels,
                 state="readonly",
-                width=16,
-            )
-            combo.pack(side=tk.LEFT, padx=2)
+                width=6,
+            ).grid(row=0, column=0, padx=2, sticky="ew")
             ttk.Button(
                 btn_row,
                 text="Label",
                 command=lambda e=exp, i=idx, rv=label_var: self._confirm_one(
                     e, i, rv.get(), card
                 ),
-            ).pack(side=tk.LEFT, padx=2)
-        else:
-            # Prediction mode: quick-confirm button for target label
+            ).grid(row=0, column=1, padx=2, sticky="ew")
             ttk.Button(
                 btn_row,
-                text=f"✓ {target_label}",
-                command=lambda e=exp, i=idx, tl=target_label: self._confirm_one(
-                    e, i, tl, card
+                text="✕ Unlabel",
+                command=lambda e=exp, i=idx: self._unlabel_one(e, i, card),
+            ).grid(row=0, column=2, padx=2, sticky="ew")
+            ttk.Button(
+                btn_row,
+                text="Save PDF",
+                command=lambda f=fig, t=title, e=exp, i=idx: self._save_trace_pdf(
+                    f, t, e, i
                 ),
-            ).pack(side=tk.LEFT, padx=2)
-
-            # Reassign dropdown for other labels
+            ).grid(row=0, column=3, padx=2, sticky="ew")
+            for col in range(4):
+                btn_row.columnconfigure(col, weight=1)
+        else:
             other_labels = [l for l in all_labels if l != target_label]
             if other_labels:
+                # 5 equal columns: [✓ label] [combo] [Assign] [✕ Unlabel] [Save PDF]
                 reassign_var = tk.StringVar(value=other_labels[0])
-                combo = ttk.Combobox(
+                ttk.Button(
+                    btn_row,
+                    text=f"✓ {target_label}",
+                    command=lambda e=exp, i=idx, tl=target_label: self._confirm_one(
+                        e, i, tl, card
+                    ),
+                ).grid(row=0, column=0, padx=2, sticky="ew")
+                ttk.Combobox(
                     btn_row,
                     textvariable=reassign_var,
                     values=other_labels,
                     state="readonly",
-                    width=14,
-                )
-                combo.pack(side=tk.LEFT, padx=2)
+                    width=5,
+                ).grid(row=0, column=1, padx=2, sticky="ew")
                 ttk.Button(
                     btn_row,
                     text="Assign",
                     command=lambda e=exp, i=idx, rv=reassign_var: self._reassign_one(
                         e, i, rv.get(), card
                     ),
-                ).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(
-            btn_row,
-            text="✕ Unlabel",
-            command=lambda e=exp, i=idx: self._unlabel_one(e, i, card),
-        ).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(
-            btn_row,
-            text="Save PDF",
-            command=lambda f=fig, t=title, e=exp, i=idx: self._save_trace_pdf(
-                f, t, e, i
-            ),
-        ).pack(side=tk.RIGHT, padx=2)
+                ).grid(row=0, column=2, padx=2, sticky="ew")
+                ttk.Button(
+                    btn_row,
+                    text="✕ Unlabel",
+                    command=lambda e=exp, i=idx: self._unlabel_one(e, i, card),
+                ).grid(row=0, column=3, padx=2, sticky="ew")
+                ttk.Button(
+                    btn_row,
+                    text="Save PDF",
+                    command=lambda f=fig, t=title, e=exp, i=idx: self._save_trace_pdf(
+                        f, t, e, i
+                    ),
+                ).grid(row=0, column=4, padx=2, sticky="ew")
+                for col in range(5):
+                    btn_row.columnconfigure(col, weight=1)
+            else:
+                # 3 equal columns: [✓ label] [✕ Unlabel] [Save PDF]
+                ttk.Button(
+                    btn_row,
+                    text=f"✓ {target_label}",
+                    command=lambda e=exp, i=idx, tl=target_label: self._confirm_one(
+                        e, i, tl, card
+                    ),
+                ).grid(row=0, column=0, padx=2, sticky="ew")
+                ttk.Button(
+                    btn_row,
+                    text="✕ Unlabel",
+                    command=lambda e=exp, i=idx: self._unlabel_one(e, i, card),
+                ).grid(row=0, column=1, padx=2, sticky="ew")
+                ttk.Button(
+                    btn_row,
+                    text="Save PDF",
+                    command=lambda f=fig, t=title, e=exp, i=idx: self._save_trace_pdf(
+                        f, t, e, i
+                    ),
+                ).grid(row=0, column=2, padx=2, sticky="ew")
+                for col in range(3):
+                    btn_row.columnconfigure(col, weight=1)
         self.card_widgets.append(card)
         return card
 
@@ -1037,7 +1317,7 @@ class _LabelerAppMethods:
         self._log(f"Unlabeled {exp}:{idx}")
 
     def _delete_label_class(self):
-        target = self.review_label_var.get()
+        target = self._get_review_label()
         if not target:
             messagebox.showinfo("Delete Class", "Select a label class first.")
             return
@@ -1213,6 +1493,53 @@ class _LabelerAppMethods:
         toolbar = NavigationToolbar2Tk(canvas, win)
         toolbar.update()
 
+    def _save_predictions(self):
+        """Save model probabilities for all traces to a CSV file."""
+        import csv
+
+        if self.labeler.proba is None or self.labeler.classes is None:
+            messagebox.showinfo("Save Predictions", "Train the model first.")
+            return
+        out_dir = Path(self._labels_path).parent
+        path = filedialog.asksaveasfilename(
+            title="Save predictions CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+            initialfile="predictions.csv",
+            initialdir=str(out_dir),
+        )
+        if not path:
+            return
+        classes = list(self.labeler.classes)
+        predicted = self.labeler.classes[np.argmax(self.labeler.proba, axis=1)]
+        fieldnames = [
+            "experiment",
+            "id",
+            "predicted_label",
+            "manual_label",
+            "is_ignored",
+        ] + [f"prob_{c}" for c in classes]
+        rows = []
+        for gi, row in self.labeler.index_df.iterrows():
+            exp, idx = row.exp, int(row.idx)
+            probs = self.labeler.proba[gi]
+            r = {
+                "experiment": exp,
+                "id": idx,
+                "predicted_label": predicted[gi],
+                "manual_label": self.labeler.get_label(exp, idx),
+                "is_ignored": self.labeler.get_sub_label(exp, idx) == IGNORED,
+            }
+            for c, p in zip(classes, probs):
+                r[f"prob_{c}"] = f"{p:.6f}"
+            rows.append(r)
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with open(path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        self._log(f"Saved predictions ({len(rows)} traces) → {path}")
+
     # ── Save / Load ──────────────────────────────────────────────────────
     def _save(self):
         path = filedialog.asksaveasfilename(
@@ -1234,6 +1561,15 @@ class _LabelerAppMethods:
         if not path:
             return
         n = self.labeler.load(path)
+        if self.labeler.n_ignored > 0:
+            self._filter_status_var.set(
+                f"{self.labeler.n_ignored}/{self.labeler.N} traces ignored"
+            )
+            # Auto-enable "Show ignored traces" so filter labels appear in the combo
+            self._show_ignored_var.set(True)
+        else:
+            self._filter_status_var.set("No filters active")
+            self._show_ignored_var.set(False)
         self._update_status()
         self._log(f"Loaded {n} labels from {path}")
 
