@@ -103,8 +103,17 @@ def fit_pelt(signal, pen_mult=1.0, min_plateau=5):
     }
 
 
-def fit_track_pelt(tr, pen_mult=1.0, min_plateau=5):
-    return {
-        ch: fit_pelt(tr[ch], pen_mult=pen_mult, min_plateau=min_plateau)
-        for ch in config.CHANNELS
-    }
+def fit_track_pelt(tr, pen_mult=1.0, min_plateau=5, ch_pen_mult=None, ch_min_plateau=None, channels=None):
+    """Fit PELT on each channel.
+
+    ch_pen_mult / ch_min_plateau are optional dicts {channel_name: value}
+    for per-channel overrides; missing channels fall back to the global scalars.
+    channels must be passed explicitly when called from joblib workers, because
+    subprocess workers import config fresh and won't see runtime mutations.
+    """
+    result = {}
+    for ch in (channels or config.CHANNELS):
+        pm = ch_pen_mult.get(ch, pen_mult) if ch_pen_mult else pen_mult
+        mp = ch_min_plateau.get(ch, min_plateau) if ch_min_plateau else min_plateau
+        result[ch] = fit_pelt(tr[ch], pen_mult=pm, min_plateau=mp)
+    return result

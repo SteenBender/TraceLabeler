@@ -79,7 +79,7 @@ def _load_and_pelt():
         tracks = all_data[exp]
         print(f"  {exp}: {len(tracks)} tracks …", end=" ", flush=True)
         results = Parallel(n_jobs=config.N_JOBS)(
-            delayed(fit_track_pelt)(tr) for tr in tracks
+            delayed(fit_track_pelt)(tr, channels=config.CHANNELS) for tr in tracks
         )
         pelt_results[exp] = results
         primary_ch = config.CHANNELS[0]

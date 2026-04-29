@@ -131,9 +131,15 @@ class PeltTunerWindow:
         self._applying = False
         self._debounce_id = None
 
+        # Per-channel parameter storage (populated in _build_per_channel_rows)
+        self._ch_pen_vars = {}
+        self._ch_plat_vars = {}
+        self._ch_pen_labels = {}
+        self._ch_plat_labels = {}
+
         self.win = tk.Toplevel(parent_app)
         self.win.title("PELT Parameter Tuner")
-        self.win.geometry("1100x700")
+        self.win.geometry("1100x750")
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -145,7 +151,7 @@ class PeltTunerWindow:
         ctrl = ttk.Frame(self.win, padding=6)
         ctrl.pack(fill=tk.X, padx=4, pady=4)
 
-        # pen_mult slider
+        # pen_mult global slider
         ttk.Label(ctrl, text="Penalty multiplier (pen×):").grid(
             row=0, column=0, sticky=tk.W
         )
@@ -166,7 +172,7 @@ class PeltTunerWindow:
             row=0, column=3, padx=(0, 20)
         )
 
-        # min_plateau slider
+        # min_plateau global slider
         ttk.Label(ctrl, text="Min plateau (frames):").grid(row=1, column=0, sticky=tk.W)
         self._plat_var = tk.IntVar(value=5)
         plat_slider = ttk.Scale(
@@ -185,9 +191,18 @@ class PeltTunerWindow:
             row=1, column=3, padx=(0, 20)
         )
 
+        # Per-channel checkbox
+        self._per_ch_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ctrl,
+            text="Per-channel PELT parameters",
+            variable=self._per_ch_var,
+            command=self._toggle_per_channel,
+        ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
+
         # Buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=0, column=4, rowspan=2, padx=8)
+        btn_frame.grid(row=0, column=4, rowspan=3, padx=8)
         ttk.Button(btn_frame, text="Resample traces", command=self._resample).pack(
             fill=tk.X, pady=2
         )
@@ -203,6 +218,13 @@ class PeltTunerWindow:
         ttk.Label(
             status_frame, textvariable=self._status_var, relief=tk.GROOVE, padding=3
         ).pack(fill=tk.X)
+
+        # ── Per-channel parameters frame (hidden until checkbox is on) ────
+        self._per_ch_frame = ttk.LabelFrame(
+            self.win, text="Per-Channel Parameters", padding=6
+        )
+        # not packed yet — shown when checkbox is toggled on
+        self._build_per_channel_rows()
 
         # ── Log panel (hidden until "Apply to ALL") ───────────────────────
         self._log_text = tk.Text(
@@ -223,6 +245,79 @@ class PeltTunerWindow:
         self._grid_frame = ttk.Frame(self.win)
         self._grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+    # ── Per-channel helpers ───────────────────────────────────────────────
+    def _build_per_channel_rows(self):
+        """Rebuild the per-channel slider rows inside _per_ch_frame."""
+        for w in self._per_ch_frame.winfo_children():
+            w.destroy()
+        self._ch_pen_vars.clear()
+        self._ch_plat_vars.clear()
+        self._ch_pen_labels.clear()
+        self._ch_plat_labels.clear()
+
+        for ch in config.CHANNELS:
+            row = ttk.Frame(self._per_ch_frame)
+            row.pack(fill=tk.X, pady=2)
+
+            ttk.Label(row, text=ch, width=14, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 6))
+
+            ttk.Label(row, text="pen×:").pack(side=tk.LEFT)
+            pen_var = tk.DoubleVar(value=self._pen_var.get())
+            self._ch_pen_vars[ch] = pen_var
+            ttk.Scale(
+                row, from_=0.2, to=10.0, orient=tk.HORIZONTAL,
+                variable=pen_var, length=150, command=self._on_slider,
+            ).pack(side=tk.LEFT, padx=4)
+            pen_lbl = ttk.Label(row, text=f"{pen_var.get():.2f}", width=5)
+            pen_lbl.pack(side=tk.LEFT)
+            self._ch_pen_labels[ch] = pen_lbl
+            pen_var.trace_add(
+                "write",
+                lambda *_, c=ch: self._ch_pen_labels[c].config(
+                    text=f"{self._ch_pen_vars[c].get():.2f}"
+                ),
+            )
+
+            ttk.Label(row, text="min_plat:").pack(side=tk.LEFT, padx=(12, 0))
+            plat_var = tk.IntVar(value=self._plat_var.get())
+            self._ch_plat_vars[ch] = plat_var
+            ttk.Scale(
+                row, from_=2, to=30, orient=tk.HORIZONTAL,
+                variable=plat_var, length=120, command=self._on_slider,
+            ).pack(side=tk.LEFT, padx=4)
+            plat_lbl = ttk.Label(row, text=str(int(plat_var.get())), width=4)
+            plat_lbl.pack(side=tk.LEFT)
+            self._ch_plat_labels[ch] = plat_lbl
+            plat_var.trace_add(
+                "write",
+                lambda *_, c=ch: self._ch_plat_labels[c].config(
+                    text=str(int(self._ch_plat_vars[c].get()))
+                ),
+            )
+
+    def _toggle_per_channel(self):
+        if self._per_ch_var.get():
+            self._per_ch_frame.pack(
+                fill=tk.X, padx=4, pady=(0, 4), before=self._grid_frame
+            )
+        else:
+            self._per_ch_frame.pack_forget()
+        if self._debounce_id is not None:
+            self.win.after_cancel(self._debounce_id)
+        self._debounce_id = self.win.after(50, self._refresh_plots)
+
+    def _get_current_params(self):
+        """Return (pen_mult, min_plateau, ch_pen_mult, ch_min_plateau)."""
+        pen_mult = self._pen_var.get()
+        min_plateau = int(self._plat_var.get())
+        if self._per_ch_var.get() and self._ch_pen_vars:
+            ch_pen_mult = {ch: self._ch_pen_vars[ch].get() for ch in config.CHANNELS}
+            ch_min_plateau = {ch: int(self._ch_plat_vars[ch].get()) for ch in config.CHANNELS}
+        else:
+            ch_pen_mult = None
+            ch_min_plateau = None
+        return pen_mult, min_plateau, ch_pen_mult, ch_min_plateau
+
     # ── Sampling ──────────────────────────────────────────────────────────
     def _resample(self):
         all_pairs = [
@@ -242,11 +337,12 @@ class PeltTunerWindow:
 
     # ── Plot refresh (sample only) ────────────────────────────────────────
     def _refresh_plots(self):
-        pen_mult = self._pen_var.get()
-        min_plateau = int(self._plat_var.get())
-        self._status_var.set(
-            f"Fitting sample with pen×={pen_mult:.2f}, min_plateau={min_plateau} …"
-        )
+        pen_mult, min_plateau, ch_pen_mult, ch_min_plateau = self._get_current_params()
+        if ch_pen_mult:
+            status_desc = "per-channel params"
+        else:
+            status_desc = f"pen×={pen_mult:.2f}, min_plateau={min_plateau}"
+        self._status_var.set(f"Fitting sample with {status_desc} …")
         self.win.update_idletasks()
 
         # Clear existing figures
@@ -260,7 +356,11 @@ class PeltTunerWindow:
         ncols = 3
         for i, (exp, idx) in enumerate(self._sample):
             tr = self._labeler.all_data[exp][idx]
-            nr_new = fit_track_pelt(tr, pen_mult=pen_mult, min_plateau=min_plateau)
+            nr_new = fit_track_pelt(
+                tr, pen_mult=pen_mult, min_plateau=min_plateau,
+                ch_pen_mult=ch_pen_mult, ch_min_plateau=ch_min_plateau,
+                channels=config.CHANNELS,
+            )
 
             row, col = divmod(i, ncols)
             step_parts = "  ".join(
@@ -297,8 +397,7 @@ class PeltTunerWindow:
             self._canvases.append(canvas)
 
         self._status_var.set(
-            f"pen×={pen_mult:.2f}, min_plateau={min_plateau} — "
-            f"showing {len(self._sample)} sample traces."
+            f"{status_desc} — showing {len(self._sample)} sample traces."
         )
 
     # ── Thread-safe log helper ────────────────────────────────────────────
@@ -339,18 +438,26 @@ class PeltTunerWindow:
         self._log_text.configure(state=tk.DISABLED)
         self._log_text.pack(fill=tk.X, padx=6, pady=(2, 4), before=self._grid_frame)
 
-        pen_mult = self._pen_var.get()
-        min_plateau = int(self._plat_var.get())
-        self._status_var.set(
-            f"Applying pen×={pen_mult:.2f}, min_plateau={min_plateau} to ALL tracks …"
-        )
+        pen_mult, min_plateau, ch_pen_mult, ch_min_plateau = self._get_current_params()
+        if ch_pen_mult:
+            status_desc = "per-channel params"
+        else:
+            status_desc = f"pen×={pen_mult:.2f}, min_plateau={min_plateau}"
+        self._status_var.set(f"Applying {status_desc} to ALL tracks …")
 
         labeler = self._labeler
         experiments = labeler.experiments
         pkl_path = labeler.pkl_path
 
         def worker():
-            self._log(f"PELT refit: pen×={pen_mult:.2f}, min_plateau={min_plateau}")
+            if ch_pen_mult:
+                pen_log = "  ".join(
+                    f"{ch}: pen×={ch_pen_mult[ch]:.2f} plat={ch_min_plateau[ch]}"
+                    for ch in config.CHANNELS
+                )
+                self._log(f"PELT refit (per-channel): {pen_log}")
+            else:
+                self._log(f"PELT refit: pen×={pen_mult:.2f}, min_plateau={min_plateau}")
 
             # ── Phase 1: PELT fitting per experiment ──
             pbar = _TkTqdm(
@@ -366,7 +473,9 @@ class PeltTunerWindow:
                     n_jobs=config.N_JOBS,
                 )(
                     delayed(fit_track_pelt)(
-                        tr, pen_mult=pen_mult, min_plateau=min_plateau
+                        tr, pen_mult=pen_mult, min_plateau=min_plateau,
+                        ch_pen_mult=ch_pen_mult, ch_min_plateau=ch_min_plateau,
+                        channels=config.CHANNELS,
                     )
                     for tr in tracks
                 )
@@ -402,14 +511,12 @@ class PeltTunerWindow:
             self._log("✓ Done — updating GUI …")
             self.win.after(
                 0,
-                lambda: self._on_applied(
-                    new_results, pen_mult, min_plateau, saved_mb, pkl_path
-                ),
+                lambda: self._on_applied(new_results, status_desc, saved_mb, pkl_path),
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_applied(self, new_results, pen_mult, min_plateau, saved_mb, pkl_path):
+    def _on_applied(self, new_results, status_desc, saved_mb, pkl_path):
         labeler = self._labeler
 
         # Update PELT results and feature matrix
@@ -447,8 +554,7 @@ class PeltTunerWindow:
             else "  No pickle path \u2014 re-run --prepare to persist."
         )
         self._status_var.set(
-            f"Applied pen\u00d7={pen_mult:.2f}, min_plateau={min_plateau} to "
-            f"{n_tracks} tracks. "
+            f"Applied {status_desc} to {n_tracks} tracks. "
             f"Model reset — retrain before reviewing predictions.{pkl_msg}"
         )
 
@@ -459,8 +565,7 @@ class PeltTunerWindow:
         try:
             self._app._update_status()
             log_msg = (
-                f"PELT refit: pen×={pen_mult:.2f}, min_plateau={min_plateau} "
-                f"\u2192 {n_tracks} tracks. Retrain the model."
+                f"PELT refit ({status_desc}) \u2192 {n_tracks} tracks. Retrain the model."
             )
             if saved_mb is not None:
                 log_msg += f" Pickle saved ({saved_mb:.1f} MB)."

@@ -25,6 +25,7 @@ from ..labeler import ActiveLabeler, UNLABELED
 from .filter_dialog import FilterDialog
 from .patch_viewer import PatchViewerWindow
 from .pelt_tuner import PeltTunerWindow
+from .umap_viewer import UmapViewerWindow
 
 # Prefix shown in the review combo for system/filter labels (not user-created)
 _FILTER_PREFIX = "\u2298 "  # ⊘
@@ -477,33 +478,49 @@ class _LabelerAppMethods:
             if os.path.exists(pkl):
                 self.after(0, lambda: self._load_status_var.set("Loading cached data…"))
                 all_data, pelt_results, stored_channels = load_prepared_data(pkl)
-                # Remap track dict keys and PELT result keys when channel names
-                # have been renamed in the startup panel.
-                if stored_channels != config.CHANNELS and len(stored_channels) == len(
-                    config.CHANNELS
-                ):
-                    rename_map = {
-                        old: new
-                        for old, new in zip(stored_channels, config.CHANNELS)
-                        if old != new
-                    }
-                    for exp in all_data:
-                        for tr in all_data[exp]:
-                            for old, new in rename_map.items():
-                                if old in tr:
-                                    tr[new] = tr.pop(old)
-                                for suffix in (
-                                    "_fit",
-                                    "_numSteps",
-                                    "_stepStart",
-                                    "_stepSize",
-                                ):
-                                    if f"{old}{suffix}" in tr:
-                                        tr[f"{new}{suffix}"] = tr.pop(f"{old}{suffix}")
-                        for nr in pelt_results[exp]:
-                            for old, new in rename_map.items():
-                                if old in nr:
-                                    nr[new] = nr.pop(old)
+                # Sync config to pkl when channel counts differ (e.g. 2-channel data
+                # loaded while config still defaults to 3 channels).
+                if stored_channels != config.CHANNELS:
+                    if len(stored_channels) != len(config.CHANNELS):
+                        # Trust the pkl — update config to match what was actually saved.
+                        new_colors = {
+                            ch: config.CHANNEL_COLORS.get(
+                                ch, config._DEFAULT_COLORS[i % len(config._DEFAULT_COLORS)]
+                            )
+                            for i, ch in enumerate(stored_channels)
+                        }
+                        new_calib = {
+                            ch: config.CALIBRATION.get(ch, 1.0)
+                            for ch in stored_channels
+                        }
+                        config.configure_channels(stored_channels, new_colors, new_calib)
+                    else:
+                        # Same count but different names — rename data keys to match
+                        # the names the user typed in the startup panel.
+                        rename_map = {
+                            old: new
+                            for old, new in zip(stored_channels, config.CHANNELS)
+                            if old != new
+                        }
+                        for exp in all_data:
+                            for tr in all_data[exp]:
+                                for old, new in rename_map.items():
+                                    if old in tr:
+                                        tr[new] = tr.pop(old)
+                                    for suffix in (
+                                        "_fit",
+                                        "_numSteps",
+                                        "_stepStart",
+                                        "_stepSize",
+                                    ):
+                                        if f"{old}{suffix}" in tr:
+                                            tr[f"{new}{suffix}"] = tr.pop(
+                                                f"{old}{suffix}"
+                                            )
+                            for nr in pelt_results[exp]:
+                                for old, new in rename_map.items():
+                                    if old in nr:
+                                        nr[new] = nr.pop(old)
             else:
                 self.after(
                     0,
@@ -731,7 +748,7 @@ class _LabelerAppMethods:
             filter_frame,
             text="Show ignored traces",
             variable=self._show_ignored_var,
-            command=self._update_status,
+            command=self._on_show_ignored_toggled,
         ).pack(anchor=tk.W)
         self._train_ignored_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -754,6 +771,46 @@ class _LabelerAppMethods:
         ttk.Button(right, text="PELT Tuner", command=self._show_pelt_tuner).pack(
             fill=tk.X, pady=2
         )
+        ttk.Button(right, text="UMAP Explorer", command=self._show_umap_explorer).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ── Plot limits ──
+        limits_frame = ttk.LabelFrame(right, text="Plot Limits", padding=4)
+        limits_frame.pack(fill=tk.X, pady=2)
+
+        self._xlim_min_var  = tk.StringVar()
+        self._xlim_max_var  = tk.StringVar()
+        self._ylim_min_var  = tk.StringVar()
+        self._ylim_max_var  = tk.StringVar()
+        self._ylim2_min_var = tk.StringVar()
+        self._ylim2_max_var = tk.StringVar()
+
+        lim_grid = ttk.Frame(limits_frame)
+        lim_grid.pack(fill=tk.X)
+        for row_i, (lbl, lo_var, hi_var) in enumerate([
+            ("X:",   self._xlim_min_var,  self._xlim_max_var),
+            ("Y_l:", self._ylim_min_var,  self._ylim_max_var),
+            ("Y_r:", self._ylim2_min_var, self._ylim2_max_var),
+        ]):
+            ttk.Label(lim_grid, text=lbl, anchor=tk.E, width=4).grid(
+                row=row_i, column=0, sticky=tk.E, padx=(0, 4), pady=1
+            )
+            ttk.Entry(lim_grid, textvariable=lo_var, width=6).grid(
+                row=row_i, column=1, padx=1, pady=1
+            )
+            ttk.Label(lim_grid, text="–").grid(row=row_i, column=2, padx=2)
+            ttk.Entry(lim_grid, textvariable=hi_var, width=6).grid(
+                row=row_i, column=3, padx=1, pady=1
+            )
+
+        ttk.Label(limits_frame, text="Leave blank for auto-scale", foreground="gray",
+                  font=("Helvetica", 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Button(
+            limits_frame, text="Apply", command=self._apply_plot_limits
+        ).pack(fill=tk.X, pady=(2, 0))
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
@@ -857,6 +914,28 @@ class _LabelerAppMethods:
         """Return the raw stored label from the review combo (strips ⊘ prefix)."""
         val = self.review_label_var.get()
         return val[len(_FILTER_PREFIX) :] if val.startswith(_FILTER_PREFIX) else val
+
+    def _on_show_ignored_toggled(self):
+        self._update_status()
+        if not self._show_ignored_var.get() and self.current_candidates:
+            # Remove ignored traces from the live pools so they don't appear on page-flip
+            self._candidate_pool = [
+                c for c in self._candidate_pool
+                if self.labeler.get_sub_label(c["exp"], c["idx"]) != IGNORED
+            ]
+            self.current_candidates = [
+                c for c in self.current_candidates
+                if self.labeler.get_sub_label(c["exp"], c["idx"]) != IGNORED
+            ]
+            max_page = max(0, (len(self.current_candidates) - 1) // self.n_per_page)
+            self.candidate_page = min(self.candidate_page, max_page)
+            self._render_page()
+        elif self._show_ignored_var.get() and self.card_widgets:
+            self._render_page()
+
+    def _apply_plot_limits(self):
+        if self.card_widgets:
+            self._render_page()
 
     # ── Actions ──────────────────────────────────────────────────────────
     def _add_label(self):
@@ -1049,6 +1128,9 @@ class _LabelerAppMethods:
     def _show_pelt_tuner(self):
         PeltTunerWindow(self)
 
+    def _show_umap_explorer(self):
+        UmapViewerWindow(self)
+
     # ── Filters ──────────────────────────────────────────────────────────
     def _open_filter_dialog(self):
         dlg = FilterDialog(self, self.labeler.channels, self.labeler.filter_config)
@@ -1189,6 +1271,9 @@ class _LabelerAppMethods:
         ax = fig.add_subplot(111)
         title_extra = "" if is_random else f"  P({target_label})={prob:.2f}"
         self.labeler.plot_trace(exp, idx, ax=ax, title_extra=title_extra)
+        # fig.axes[1] is the twinx secondary y-axis created inside plot_trace
+        ax2 = fig.axes[1] if len(fig.axes) > 1 else None
+        self._apply_axis_limits(ax, ax2)
         fig.tight_layout(pad=0.4)
         self._card_figures.append(fig)
         canvas = FigureCanvasTkAgg(fig, master=card)
@@ -1297,6 +1382,43 @@ class _LabelerAppMethods:
                     btn_row.columnconfigure(col, weight=1)
         self.card_widgets.append(card)
         return card
+
+    def _apply_axis_limits(self, ax, ax2=None):
+        """Apply user-specified limits: X to ax (twinx shares it), Y_l to ax, Y_r to ax2."""
+        try:
+            xmin_s = self._xlim_min_var.get().strip()
+            xmax_s = self._xlim_max_var.get().strip()
+            if xmin_s or xmax_s:
+                cur = ax.get_xlim()
+                ax.set_xlim(
+                    float(xmin_s) if xmin_s else cur[0],
+                    float(xmax_s) if xmax_s else cur[1],
+                )
+        except (ValueError, AttributeError):
+            pass
+        try:
+            ymin_s = self._ylim_min_var.get().strip()
+            ymax_s = self._ylim_max_var.get().strip()
+            if ymin_s or ymax_s:
+                cur = ax.get_ylim()
+                ax.set_ylim(
+                    float(ymin_s) if ymin_s else cur[0],
+                    float(ymax_s) if ymax_s else cur[1],
+                )
+        except (ValueError, AttributeError):
+            pass
+        if ax2 is not None:
+            try:
+                ymin2_s = self._ylim2_min_var.get().strip()
+                ymax2_s = self._ylim2_max_var.get().strip()
+                if ymin2_s or ymax2_s:
+                    cur2 = ax2.get_ylim()
+                    ax2.set_ylim(
+                        float(ymin2_s) if ymin2_s else cur2[0],
+                        float(ymax2_s) if ymax2_s else cur2[1],
+                    )
+            except (ValueError, AttributeError):
+                pass
 
     def _confirm_one(self, exp, idx, label, card):
         self.labeler.set_label(exp, idx, label)
